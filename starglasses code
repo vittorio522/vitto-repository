@@ -1,0 +1,345 @@
+/*
+  SKYMAP REALISTICA su OLED (128x64 I2C) - Arduino Uno/Nano
+  =========================================================
+
+  Calcola la posizione reale (alt/azimuth) di ~30 stelle brillanti
+  in base a data/ora/posizione (da GPS) e mostra solo quelle nel
+  campo visivo verso cui è orientato il dispositivo.
+
+  ORIENTAMENTO:
+   - Altezza (tilt) letta dall'accelerometro -> stabile, nessuna deriva.
+   - Direzione (azimuth/bussola) stimata integrando il giroscopio ->
+     DERIVA nel tempo (non c'è magnetometro). Premi il pulsante di
+     ricalibrazione mentre punti il dispositivo verso Nord per azzerare.
+
+  HARDWARE:
+   - OLED SSD1306/SH1106 128x64 - I2C (SDA=A4, SCL=A5)
+   - GPS (es. NEO-6M) - SoftwareSerial su pin 4(RX)/3(TX), 9600 baud
+   - MPU6050 - I2C (stesso bus, indirizzo 0x68, AD0 a GND)
+   - Pulsante ricalibrazione Nord - pin 2 a GND (usa INPUT_PULLUP)
+
+  LIBRERIE RICHIESTE (Library Manager):
+   - Adafruit SSD1306
+   - Adafruit GFX Library
+   - TinyGPSPlus (di Mikal Hart)
+
+  NOTA: la mappatura degli assi dell'accelerometro (pitch) dipende da
+  come monti fisicamente l'MPU6050. Se l'inclinazione risulta invertita
+  o sbagliata, prova a scambiare gli assi nella funzione readTiltPitch().
+*/
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+//#include <SoftwareSerial.h>
+//#include <TinyGPSPlus.h>
+#include <math.h>
+
+// ---------------- DISPLAY ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+double latitude = 45.4384;     // esempio
+double longitude = 12.3271;
+
+bool coordinatesSet = false;
+
+void readCoordinatesFromSerial() {
+
+  if (!Serial.available()) return;
+
+  String line = Serial.readStringUntil('\n');
+  line.trim();
+
+  int comma = line.indexOf(',');
+
+  if (comma == -1) {
+    Serial.println("Formato: latitudine,longitudine");
+    Serial.println("Esempio: 44.8354,11.6198");
+    return;
+  }
+
+  latitude = line.substring(0, comma).toFloat();
+  longitude = line.substring(comma + 1).toFloat();
+
+  coordinatesSet = true;
+
+  Serial.println("Coordinate aggiornate:");
+  Serial.print("Lat = ");
+  Serial.println(latitude, 6);
+  Serial.print("Lon = ");
+  Serial.println(longitude, 6);
+}
+
+/* ---------------- GPS ----------------
+SoftwareSerial gpsSerial(4, 3); // RX, TX (RX <- GPS TX)
+TinyGPSPlus gps;*/
+
+// ---------------- MPU6050 ----------------
+#define MPU_ADDR 0x68
+#define BUTTON_PIN 2
+
+float heading = 0.0;      // azimuth stimato (gradi, 0=Nord, orario)
+float gyroZOffset = 0.0;
+unsigned long lastMicros = 0;
+
+// ---------------- CAMPO VISIVO ----------------
+const float FOV_H = 60.0; // gradi orizzontali
+const float FOV_V = 30.0; // gradi verticali (coerente con aspect ratio 2:1)
+
+// ---------------- CATALOGO STELLE ----------------
+// RA e Dec in gradi (epoca ~J2000, valori approssimati ma sufficienti
+// per una visualizzazione a bassa risoluzione). Magnitudine: più bassa = più luminosa.
+struct StarData {
+  float ra;
+  float dec;
+  float mag;
+};
+
+const StarData catalog[] PROGMEM = {
+  {101.287, -16.716, -1.46}, // Sirius
+  { 95.988, -52.696, -0.72}, // Canopus
+  {219.902, -60.834, -0.27}, // Alpha Centauri
+  {213.915,  19.182, -0.05}, // Arcturus
+  {279.234,  38.784,  0.03}, // Vega
+  { 79.172,  45.998,  0.08}, // Capella
+  { 78.634,  -8.202,  0.13}, // Rigel
+  {114.825,   5.225,  0.34}, // Procyon
+  { 24.429, -57.237,  0.46}, // Achernar
+  { 88.793,   7.407,  0.42}, // Betelgeuse
+  {210.956, -60.373,  0.61}, // Hadar
+  {297.696,   8.868,  0.77}, // Altair
+  {186.650, -63.099,  0.77}, // Acrux
+  { 68.980,  16.509,  0.85}, // Aldebaran
+  {201.298, -11.161,  0.98}, // Spica
+  {247.352, -26.432,  1.06}, // Antares
+  {116.329,  28.026,  1.14}, // Pollux
+  {344.413, -29.622,  1.16}, // Fomalhaut
+  {310.358,  45.280,  1.25}, // Deneb
+  {191.930, -59.689,  1.25}, // Mimosa
+  {152.093,  11.967,  1.35}, // Regulus
+  {104.656, -28.972,  1.50}, // Adhara
+  {113.649,  31.888,  1.58}, // Castor
+  {263.402, -37.104,  1.62}, // Shaula
+  {193.507,  55.960,  1.76}, // Alioth
+  {165.932,  61.751,  1.79}, // Dubhe
+  { 51.081,  49.861,  1.79}, // Mirfak
+  {276.043, -34.385,  1.85}, // Kaus Australis
+  {206.885,  49.313,  1.86}, // Alkaid
+  { 37.955,  89.264,  1.98}, // Polaris
+};
+const int NUM_STARS = sizeof(catalog) / sizeof(StarData);
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+  //gpsSerial.begin(9600);
+  Wire.begin();
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println("OLED non trovato!");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  initMPU();
+  calibrateGyro();
+
+  lastMicros = micros();
+  Serial.println();
+  Serial.println("Inserisci le coordinate nel formato:");
+  Serial.println("45.4384,12.3271");
+}
+
+// ================= LOOP =================
+void loop() {
+  /* leggi GPS
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }*/
+  readCoordinatesFromSerial();
+
+  // ricalibrazione Nord
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    heading = 0.0;
+  }
+
+  updateOrientation();
+
+  display.clearDisplay();
+
+  if (coordinatesSet)  {
+    double lat = latitude; 
+    double lon = longitude;
+    double jd = julianDate(2026, 7, 13,
+                       21, 30, 0);
+    double lst = localSiderealTime(jd, lon);
+
+    float pitch = readTiltPitch();
+
+    for (int i = 0; i < NUM_STARS; i++) {
+      StarData s;
+      memcpy_P(&s, &catalog[i], sizeof(StarData));
+
+      float alt, az;
+      computeAltAz(s.ra, s.dec, lat, lst, alt, az);
+
+      if (alt < 0) continue; // sotto l'orizzonte
+
+      float azDiff = normalizeDeg180(az - heading);
+      float altDiff = alt - pitch;
+
+      if (fabs(azDiff) > FOV_H / 2.0 || fabs(altDiff) > FOV_V / 2.0) continue;
+
+      int x = SCREEN_WIDTH / 2 + (int)((azDiff / (FOV_H / 2.0)) * (SCREEN_WIDTH / 2.0));
+      int y = SCREEN_HEIGHT / 2 - (int)((altDiff / (FOV_V / 2.0)) * (SCREEN_HEIGHT / 2.0));
+
+      if (x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) continue;
+
+      if (s.mag < 0.5) display.fillCircle(x, y, 2, SSD1306_WHITE);
+      else if (s.mag < 1.5) display.fillCircle(x, y, 1, SSD1306_WHITE);
+      else display.drawPixel(x, y, SSD1306_WHITE);
+    }
+
+    // overlay informativo (rimuovi se vuoi solo la grafica pulita)
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.print("Az:");
+    display.print((int)heading);
+    display.print(" Alt:");
+    display.print((int)pitch);
+  } else {
+    display.setCursor(0, 0);
+    display.print("Inserisci dati");
+    display.setCursor(0, 10);
+    display.print("da seriale");
+  }
+
+  display.display();
+  delay(150);
+}
+
+// ================= MPU6050 =================
+void initMPU() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1
+  Wire.write(0);
+  Wire.endTransmission(true);
+}
+
+void readMPURaw(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+  ax = Wire.read() << 8 | Wire.read();
+  ay = Wire.read() << 8 | Wire.read();
+  az = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read(); // temperatura, ignorata
+  gx = Wire.read() << 8 | Wire.read();
+  gy = Wire.read() << 8 | Wire.read();
+  gz = Wire.read() << 8 | Wire.read();
+}
+
+void calibrateGyro() {
+  Serial.println("Calibrazione giroscopio: tieni fermo il dispositivo...");
+  long sum = 0;
+  int16_t ax, ay, az, gx, gy, gz;
+  const int N = 200;
+  for (int i = 0; i < N; i++) {
+    readMPURaw(ax, ay, az, gx, gy, gz);
+    sum += gz;
+    delay(3);
+  }
+  gyroZOffset = sum / (float)N;
+  Serial.println("Calibrazione completata.");
+}
+
+// Aggiorna heading (integrazione giroscopio) - CHIAMARE OGNI LOOP
+void updateOrientation() {
+  int16_t ax, ay, az, gx, gy, gz;
+  readMPURaw(ax, ay, az, gx, gy, gz);
+
+  unsigned long now = micros();
+  float dt = (now - lastMicros) / 1000000.0;
+  lastMicros = now;
+
+  // sensibilita' default MPU6050 (+-250 deg/s): 131 LSB per deg/s
+  float gzDps = (gz - gyroZOffset) / 131.0;
+  heading += gzDps * dt;
+  heading = normalizeDeg360(heading);
+}
+
+// Inclinazione (pitch) dall'accelerometro - stabile, nessuna deriva.
+// NOTA: se il risultato è invertito o sbagliato rispetto al montaggio
+// fisico, prova a scambiare ax/ay/az qui sotto.
+float readTiltPitch() {
+  int16_t ax, ay, az, gx, gy, gz;
+  readMPURaw(ax, ay, az, gx, gy, gz);
+  float pitch = atan2(-ax, sqrt((float)ay * ay + (float)az * az)) * 180.0 / PI;
+  return pitch;
+}
+
+// ================= ASTRONOMIA =================
+double julianDate(int year, int month, int day, int hour, int minute, int second) {
+  double ut = hour + minute / 60.0 + second / 3600.0;
+  double jd = 367.0 * year
+              - floor(7.0 * (year + floor((month + 9.0) / 12.0)) / 4.0)
+              + floor(275.0 * month / 9.0)
+              + day + 1721013.5 + ut / 24.0;
+  return jd;
+}
+
+double localSiderealTime(double jd, double lonDeg) {
+  double T = (jd - 2451545.0) / 36525.0;
+  double gmst = 280.46061837 + 360.98564736629 * (jd - 2451545.0)
+                + 0.000387933 * T * T - (T * T * T) / 38710000.0;
+  double lst = gmst + lonDeg;
+  lst = fmod(lst, 360.0);
+  if (lst < 0) lst += 360.0;
+  return lst;
+}
+
+void computeAltAz(float raDeg, float decDeg, double latDeg, double lstDeg, float &altOut, float &azOut) {
+  double H = lstDeg - raDeg; // hour angle in gradi
+  H = fmod(H, 360.0);
+  if (H < 0) H += 360.0;
+
+  double Hrad = H * PI / 180.0;
+  double decRad = decDeg * PI / 180.0;
+  double latRad = latDeg * PI / 180.0;
+
+  double sinAlt = sin(decRad) * sin(latRad) + cos(decRad) * cos(latRad) * cos(Hrad);
+  double alt = asin(sinAlt);
+
+  double cosA = (sin(decRad) - sin(alt) * sin(latRad)) / (cos(alt) * cos(latRad));
+  // clamp per errori di arrotondamento
+  if (cosA > 1.0) cosA = 1.0;
+  if (cosA < -1.0) cosA = -1.0;
+  double A = acos(cosA);
+
+  double az;
+  if (sin(Hrad) > 0) az = 360.0 - (A * 180.0 / PI);
+  else az = A * 180.0 / PI;
+
+  altOut = alt * 180.0 / PI;
+  azOut = az;
+}
+
+float normalizeDeg360(float deg) {
+  deg = fmod(deg, 360.0);
+  if (deg < 0) deg += 360.0;
+  return deg;
+}
+
+float normalizeDeg180(float deg) {
+  deg = normalizeDeg360(deg);
+  if (deg > 180.0) deg -= 360.0;
+  return deg;
+}
