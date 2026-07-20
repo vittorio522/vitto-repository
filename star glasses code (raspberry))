@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+AR SKYMAP - Raspberry Pi 5 + Camera + BNO055
+==============================================
+Occhiali AR: sovrappone la posizione reale delle stelle sul feed
+della fotocamera, in base all'orientamento letto dal BNO055.
+
+HARDWARE:
+ - Raspberry Pi 5
+ - Camera Module (Pi Camera v2/v3, via CSI, usando picamera2)
+ - BNO055 su I2C1 (SDA=GPIO2 pin3, SCL=GPIO3 pin5)
+ - Display di output: qualunque schermo HDMI/USB collegato agli
+   occhiali (per un display SPI/mini-HDMI dedicato si sostituisce
+   la funzione show_frame() in fondo)
+
+INSTALLAZIONE:
+    sudo raspi-config          # Interface Options -> I2C -> Enable
+                                # Interface Options -> Camera -> Enable
+    sudo apt update
+    sudo apt install -y python3-opencv python3-picamera2 i2c-tools
+    pip3 install adafruit-circuitpython-bno055 adafruit-blinka
+
+TEST PRELIMINARE (fai questo PRIMA di lanciare lo script):
+    sudo i2cdetect -y 1        # deve mostrare 28 o 29
+    libcamera-hello --list-cameras   # verifica che la camera sia vista
+
+CONFIGURAZIONE POSIZIONE/ORA:
+ Modifica le costanti LAT / LON qui sotto, oppure collega un modulo
+ GPS USB/UART e usa gps_reader.py (vedi nota in fondo al file).
+"""
+
+import time
+import math
+import datetime
+
+import cv2
+import numpy as np
+import board
+import busio
+import adafruit_bno055
+
+from picamera2 import Picamera2
+
+# ---------------- CONFIGURAZIONE ----------------
+LAT = 44.8354          # <-- la tua latitudine
+LON = 11.6198           # <-- la tua longitudine
+FOV_H_DEG = 62.2         # campo visivo orizzontale della camera (Pi Cam v2 ~62.2°)
+FOV_V_DEG = 48.8         # campo visivo verticale (Pi Cam v2 ~48.8°)
+FRAME_W = 640
+FRAME_H = 480
+
+# ---------------- CATALOGO STELLE (RA, Dec, magnitudine) ----------------
+STAR_CATALOG = [
+    ("Sirius",      101.287, -16.716, -1.46),
+    ("Canopus",      95.988, -52.696, -0.72),
+    ("Alpha Cen",   219.902, -60.834, -0.27),
+    ("Arcturus",    213.915,  19.182, -0.05),
+    ("Vega",        279.234,  38.784,  0.03),
+    ("Capella",      79.172,  45.998,  0.08),
+    ("Rigel",        78.634,  -8.202,  0.13),
+    ("Procyon",     114.825,   5.225,  0.34),
+    ("Achernar",     24.429, -57.237,  0.46),
+    ("Betelgeuse",   88.793,   7.407,  0.42),
+    ("Hadar",       210.956, -60.373,  0.61),
+    ("Altair",      297.696,   8.868,  0.77),
+    ("Acrux",       186.650, -63.099,  0.77),
+    ("Aldebaran",    68.980,  16.509,  0.85),
+    ("Spica",       201.298, -11.161,  0.98),
+    ("Antares",     247.352, -26.432,  1.06),
+    ("Pollux",      116.329,  28.026,  1.14),
+    ("Fomalhaut",   344.413, -29.622,  1.16),
+    ("Deneb",       310.358,  45.280,  1.25),
+    ("Mimosa",      191.930, -59.689,  1.25),
+    ("Regulus",     152.093,  11.967,  1.35),
+    ("Adhara",      104.656, -28.972,  1.50),
+    ("Castor",      113.649,  31.888,  1.58),
+    ("Shaula",      263.402, -37.104,  1.62),
+    ("Alioth",      193.507,  55.960,  1.76),
+    ("Dubhe",       165.932,  61.751,  1.79),
+    ("Mirfak",       51.081,  49.861,  1.79),
+    ("Kaus Aust.",  276.043, -34.385,  1.85),
+    ("Alkaid",      206.885,  49.313,  1.86),
+    ("Polaris",      37.955,  89.264,  1.98),
+]
+
+# ---------------- ASTRONOMIA ----------------
+def julian_date(dt_utc):
+    y, mo, d = dt_utc.year, dt_utc.month, dt_utc.day
+    ut = dt_utc.hour + dt_utc.minute / 60.0 + dt_utc.second / 3600.0
+    jd = (367.0 * y
+          - math.floor(7.0 * (y + math.floor((mo + 9.0) / 12.0)) / 4.0)
+          + math.floor(275.0 * mo / 9.0)
+          + d + 1721013.5 + ut / 24.0)
+    return jd
+
+
+def local_sidereal_time(jd, lon_deg):
+    T = (jd - 2451545.0) / 36525.0
+    gmst = (280.46061837 + 360.98564736629 * (jd - 2451545.0)
+            + 0.000387933 * T * T - (T ** 3) / 38710000.0)
+    lst = (gmst + lon_deg) % 360.0
+    return lst
+
+
+def compute_alt_az(ra_deg, dec_deg, lat_deg, lst_deg):
+    H = (lst_deg - ra_deg) % 360.0
+    Hrad = math.radians(H)
+    dec_rad = math.radians(dec_deg)
+    lat_rad = math.radians(lat_deg)
+
+    sin_alt = (math.sin(dec_rad) * math.sin(lat_rad)
+               + math.cos(dec_rad) * math.cos(lat_rad) * math.cos(Hrad))
+    alt = math.asin(max(-1.0, min(1.0, sin_alt)))
+
+    denom = math.cos(alt) * math.cos(lat_rad)
+    if abs(denom) < 1e-6:
+        az = 0.0
+    else:
+        cos_a = (math.sin(dec_rad) - math.sin(alt) * math.sin(lat_rad)) / denom
+        cos_a = max(-1.0, min(1.0, cos_a))
+        A = math.acos(cos_a)
+        az = (360.0 - math.degrees(A)) if math.sin(Hrad) > 0 else math.degrees(A)
+
+    return math.degrees(alt), az
+
+
+def norm180(deg):
+    deg = deg % 360.0
+    if deg > 180.0:
+        deg -= 360.0
+    return deg
+
+
+# ---------------- BNO055 ----------------
+def init_bno():
+    i2c = busio.I2C(board.SCL, board.SDA)
+    sensor = adafruit_bno055.BNO055_I2C(i2c)
+    return sensor
+
+
+def read_orientation(sensor):
+    """Ritorna (heading, pitch) in gradi. Adatta qui se orientamento
+    montato sugli occhiali risulta invertito/scambiato."""
+    euler = sensor.euler
+    if euler is None or euler[0] is None:
+        return None, None
+    heading, roll, pitch = euler
+    heading = heading % 360.0
+    return heading, pitch
+
+
+# ---------------- OVERLAY SULLA CAMERA ----------------
+def draw_overlay(frame, heading, pitch, lat, lon):
+    now = datetime.datetime.utcnow()
+    jd = julian_date(now)
+    lst = local_sidereal_time(jd, lon)
+
+    h, w = frame.shape[:2]
+
+    for name, ra, dec, mag in STAR_CATALOG:
+        alt, az = compute_alt_az(ra, dec, lat, lst)
+        if alt < 0:
+            continue  # sotto l'orizzonte
+
+        az_diff = norm180(az - heading)
+        alt_diff = alt - pitch
+
+        if abs(az_diff) > FOV_H_DEG / 2.0 or abs(alt_diff) > FOV_V_DEG / 2.0:
+            continue
+
+        x = int(w / 2 + (az_diff / (FOV_H_DEG / 2.0)) * (w / 2.0))
+        y = int(h / 2 - (alt_diff / (FOV_V_DEG / 2.0)) * (h / 2.0))
+
+        if not (0 <= x < w and 0 <= y < h):
+            continue
+
+        radius = 5 if mag < 0.0 else (3 if mag < 1.0 else 2)
+        cv2.circle(frame, (x, y), radius, (255, 255, 255), -1)
+
+        if mag < 1.0:
+            cv2.putText(frame, name, (x + 6, y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # overlay info in alto a sinistra
+    info = f"Az:{heading:5.1f}  Alt:{pitch:5.1f}"
+    cv2.putText(frame, info, (10, 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+
+    return frame
+
+
+# ---------------- MAIN LOOP ----------------
+def main():
+    print("Inizializzazione BNO055...")
+    bno = init_bno()
+
+    print("Inizializzazione fotocamera...")
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(
+        main={"size": (FRAME_W, FRAME_H), "format": "RGB888"}
+    )
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(1)
+
+    print("Pronto. Premi 'q' per uscire.")
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+
+            heading, pitch = read_orientation(bno)
+            if heading is not None:
+                frame = draw_overlay(frame, heading, pitch, LAT, LON)
+            else:
+                cv2.putText(frame, "BNO055: calibrazione...", (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1, cv2.LINE_AA)
+
+            cv2.imshow("AR Skymap", frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    finally:
+        picam2.stop()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
