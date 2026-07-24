@@ -1,0 +1,674 @@
+import sys
+import pygame
+import numpy as np
+import time
+import math
+import serial
+import datetime
+import os
+import logging
+import urllib.request
+import threading
+
+# ==========================================
+# CONFIGURAZIONE LOGGING
+# ==========================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ==========================================
+# GESTIONE IMPORT LIBRERIE & HARDWARE
+# ==========================================
+try:
+    import ephem
+    HAS_EPHEM = True
+except ModuleNotFoundError:
+    HAS_EPHEM = False
+    logging.warning("Libreria 'ephem' non trovata. Installare con 'pip install ephem'")
+
+try:
+    import board
+    import busio
+    import adafruit_bno055
+    HAS_BNO055 = True
+except ModuleNotFoundError:
+    HAS_BNO055 = False
+    logging.warning("Librerie BNO055 non trovate. Sensore orientamento disabilitato.")
+
+try:
+    import pynmea2
+    HAS_GPS = True
+except ModuleNotFoundError:
+    HAS_GPS = False
+    logging.warning("Libreria 'pynmea2' non trovata. GPS disabilitato.")
+
+try:
+    from picamera2 import Picamera2
+    HAS_PICAMERA2 = True
+except ImportError:
+    Picamera2 = None
+    HAS_PICAMERA2 = False
+    logging.warning("Libreria 'picamera2' non trovata.")
+
+try:
+    from gpiozero import Button
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
+    logging.warning("Libreria 'gpiozero' non trovata. Pulsanti fisici disabilitati.")
+
+
+# ==========================================
+# 1. CONFIGURAZIONE DISPLAY & FOV
+# ==========================================
+pygame.init()
+
+FORCE_RESOLUTION = None 
+
+if FORCE_RESOLUTION:
+    SCREEN_WIDTH, SCREEN_HEIGHT = FORCE_RESOLUTION
+else:
+    info_object = pygame.display.Info()
+    SCREEN_WIDTH = info_object.current_w
+    SCREEN_HEIGHT = info_object.current_h
+
+# Fallback di sicurezza per il display su Raspberry Pi
+try:
+    flags = pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
+except pygame.error:
+    logging.warning("Fullscreen HWSURFACE non disponibile, uso modalità finestra.")
+    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+pygame.mouse.set_visible(False)
+pygame.display.set_caption("StarGlasses AR")
+
+try:
+    font_small = pygame.font.SysFont("monospace", 14, bold=True)
+    font_hud = pygame.font.SysFont("monospace", 18, bold=True)
+    font_big = pygame.font.SysFont("monospace", 22, bold=True)
+except Exception:
+    font_small = pygame.font.Font(None, 16)
+    font_hud = pygame.font.Font(None, 22)
+    font_big = pygame.font.Font(None, 28)
+
+# Font costellazioni sicuro
+font_const = pygame.font.Font(None, 26)
+
+FOV_HORIZ_DEG = 66.0
+FOV_VERT_DEG = 41.0
+PX_PER_DEG_X = SCREEN_WIDTH / FOV_HORIZ_DEG
+PX_PER_DEG_Y = SCREEN_HEIGHT / FOV_VERT_DEG
+
+
+# ==========================================
+# 2. STATO APPLICAZIONE & COLORI
+# ==========================================
+state = {
+    "target_index": 0,
+    "yaw_offset": 0.0,
+    "calib_msg_frames": 0,
+    "show_camera": True,
+    "night_mode": False,
+    "sat_blink_toggle": True,
+    "swap_colors": True  # Di default invertiamo i colori per Pygame su Raspberry Pi
+}
+
+def get_colors():
+    if state["night_mode"]:
+        return {
+            "bg": (0, 0, 0), "hud": (200, 0, 0), "target": (255, 60, 0),
+            "orange": (220, 50, 0), "star": (180, 0, 0), "planet": (220, 30, 0),
+            "deep_sky": (180, 0, 0), "warn": (255, 0, 0), "constellation": (150, 0, 0),
+            "satellite": (150, 0, 0), "constellation_name": (120, 0, 0)
+        }
+    else:
+        return {
+            "bg": (0, 0, 0), "hud": (0, 255, 0), "target": (255, 165, 0),
+            "orange": (255, 140, 0), "star": (255, 255, 255), "planet": (255, 215, 0),
+            "deep_sky": (255, 140, 0), "warn": (255, 50, 50), "constellation": (0, 255, 0),
+            "satellite": (0, 255, 255), "constellation_name": (0, 180, 0)
+        }
+
+
+# ==========================================
+# 3. CATALOGO ASTRONOMICO
+# ==========================================
+def create_fixed_body(ra, dec, name):
+    if not HAS_EPHEM:
+        return None
+    body = ephem.FixedBody()
+    body._ra = ephem.hours(ra)
+    body._dec = ephem.degrees(dec)
+    body._epoch = ephem.J2000
+    return body
+
+CELESTIAL_CATALOG = [
+    # Pianeti
+    {"name": "Mars", "ephem": ephem.Mars() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": -0.5, "type": "planet"},
+    {"name": "Jupiter", "ephem": ephem.Jupiter() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": -2.5, "type": "planet"},
+    {"name": "Saturn", "ephem": ephem.Saturn() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.6, "type": "planet"},
+    {"name": "Venus", "ephem": ephem.Venus() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": -4.2, "type": "planet"},
+    
+    # Stelle principali
+    {"name": "Sirius", "ephem": ephem.star('Sirius') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": -1.46, "type": "star"},
+    {"name": "Betelgeuse", "ephem": ephem.star('Betelgeuse') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.50, "type": "star"},
+    {"name": "Rigel", "ephem": ephem.star('Rigel') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.13, "type": "star"},
+    {"name": "Vega", "ephem": ephem.star('Vega') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.03, "type": "star"},
+    {"name": "Arcturus", "ephem": ephem.star('Arcturus') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": -0.05, "type": "star"},
+    {"name": "Aldebaran", "ephem": ephem.star('Aldebaran') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.85, "type": "star"},
+    {"name": "Polaris", "ephem": ephem.star('Polaris') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.98, "type": "star"},
+    
+    # Triangolo Estivo
+    {"name": "Altair", "ephem": ephem.star('Altair') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.77, "type": "star"},
+    {"name": "Deneb", "ephem": ephem.star('Deneb') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.25, "type": "star"},
+    
+    # Orione completo
+    {"name": "Bellatrix", "ephem": ephem.star('Bellatrix') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.64, "type": "star"},
+    {"name": "Mintaka", "ephem": ephem.star('Mintaka') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 2.23, "type": "star"},
+    {"name": "Alnilam", "ephem": ephem.star('Alnilam') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.69, "type": "star"},
+    {"name": "Alnitak", "ephem": ephem.star('Alnitak') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.77, "type": "star"},
+    {"name": "Saiph", "ephem": ephem.star('Saiph') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 2.09, "type": "star"},
+    
+    # Altre stelle luminose
+    {"name": "Capella", "ephem": ephem.star('Capella') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.08, "type": "star"},
+    {"name": "Procyon", "ephem": ephem.star('Procyon') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 0.34, "type": "star"},
+    {"name": "Antares", "ephem": ephem.star('Antares') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.06, "type": "star"},
+    {"name": "Spica", "ephem": ephem.star('Spica') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.04, "type": "star"},
+    {"name": "Pollux", "ephem": ephem.star('Pollux') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0, "mag": 1.14, "type": "star"},
+
+    # Cassiopea (La W)
+    {"name": "Caph", "ephem": create_fixed_body('00:09:10.6', '+59:08:59', 'Caph'), "az": 0.0, "alt": 0.0, "mag": 2.27, "type": "star"},
+    {"name": "Schedar", "ephem": create_fixed_body('00:40:30.4', '+56:32:14', 'Schedar'), "az": 0.0, "alt": 0.0, "mag": 2.24, "type": "star"},
+    {"name": "GammaCas", "ephem": create_fixed_body('00:56:42.5', '+60:43:00', 'GammaCas'), "az": 0.0, "alt": 0.0, "mag": 2.47, "type": "star"},
+    {"name": "Ruchbah", "ephem": create_fixed_body('01:25:48.9', '+60:14:07', 'Ruchbah'), "az": 0.0, "alt": 0.0, "mag": 2.68, "type": "star"},
+    {"name": "Segin", "ephem": create_fixed_body('01:54:23.3', '+63:40:00', 'Segin'), "az": 0.0, "alt": 0.0, "mag": 3.38, "type": "star"},
+
+    # Orsa Minore (Piccolo Carro)
+    {"name": "Kochab", "ephem": create_fixed_body('14:50:42.3', '+74:09:20', 'Kochab'), "az": 0.0, "alt": 0.0, "mag": 2.08, "type": "star"},
+    {"name": "Pherkad", "ephem": create_fixed_body('15:20:43.7', '+71:50:02', 'Pherkad'), "az": 0.0, "alt": 0.0, "mag": 3.00, "type": "star"},
+
+    # Orsa Maggiore (Grande Carro)
+    {"name": "Dubhe", "ephem": create_fixed_body('11:03:43.7', '+61:45:03', 'Dubhe'), "az": 0.0, "alt": 0.0, "mag": 1.79, "type": "star"},
+    {"name": "Merak", "ephem": create_fixed_body('11:01:50.5', '+56:22:56', 'Merak'), "az": 0.0, "alt": 0.0, "mag": 2.37, "type": "star"},
+    {"name": "Phecda", "ephem": create_fixed_body('11:53:49.8', '+53:41:41', 'Phecda'), "az": 0.0, "alt": 0.0, "mag": 2.44, "type": "star"},
+    {"name": "Megrez", "ephem": create_fixed_body('12:15:25.6', '+57:01:57', 'Megrez'), "az": 0.0, "alt": 0.0, "mag": 3.31, "type": "star"},
+    {"name": "Alioth", "ephem": create_fixed_body('12:54:01.7', '+55:57:35', 'Alioth'), "az": 0.0, "alt": 0.0, "mag": 1.77, "type": "star"},
+    {"name": "Mizar", "ephem": create_fixed_body('13:23:55.5', '+54:55:31', 'Mizar'), "az": 0.0, "alt": 0.0, "mag": 2.23, "type": "star"},
+    {"name": "Alkaid", "ephem": create_fixed_body('13:47:32.4', '+49:18:48', 'Alkaid'), "az": 0.0, "alt": 0.0, "mag": 1.86, "type": "star"},
+
+    # Oggetti Deep-Sky
+    {"name": "Andromeda M31", "ephem": create_fixed_body('00:42:44.3', '+41:16:09', 'Andromeda M31'), "az": 0.0, "alt": 0.0, "mag": 3.4, "type": "deep_sky"},
+    {"name": "Orion Nebula M42", "ephem": create_fixed_body('05:35:17.3', '-05:23:28', 'Orion M42'), "az": 0.0, "alt": 0.0, "mag": 4.0, "type": "deep_sky"},
+    {"name": "Pleiades M45", "ephem": create_fixed_body('03:47:24.0', '+24:07:00', 'Pleiades M45'), "az": 0.0, "alt": 0.0, "mag": 1.6, "type": "deep_sky"}
+]
+
+CONSTELLATION_LINES = [
+    ("Betelgeuse", "Bellatrix"), ("Betelgeuse", "Alnitak"), 
+    ("Alnitak", "Alnilam"), ("Alnilam", "Mintaka"),
+    ("Mintaka", "Rigel"), ("Rigel", "Saiph"), ("Saiph", "Alnitak"),
+    ("Vega", "Altair"), ("Altair", "Deneb"), ("Deneb", "Vega"),
+    ("Caph", "Schedar"), ("Schedar", "GammaCas"), ("GammaCas", "Ruchbah"), ("Ruchbah", "Segin"),
+    ("Polaris", "Kochab"), ("Kochab", "Pherkad"),
+    ("Dubhe", "Merak"), ("Merak", "Phecda"), ("Phecda", "Megrez"), 
+    ("Megrez", "Dubhe"), ("Megrez", "Alioth"), ("Alioth", "Mizar"), ("Mizar", "Alkaid")
+]
+
+CONSTELLATION_GROUPS = {
+    "ORION": ["Betelgeuse", "Bellatrix", "Alnitak", "Alnilam", "Mintaka", "Rigel", "Saiph"],
+    "CASSIOPEIA": ["Caph", "Schedar", "GammaCas", "Ruchbah", "Segin"],
+    "URSA MINOR": ["Polaris", "Kochab", "Pherkad"],
+    "URSA MAJOR": ["Dubhe", "Merak", "Phecda", "Megrez", "Alioth", "Mizar", "Alkaid"],
+    "SUMMER TRIANGLE": ["Vega", "Altair", "Deneb"]
+}
+
+
+# ==========================================
+# 4. MOTORE DI CALCOLO E SATELLITI
+# ==========================================
+SATELLITES = []
+
+def fetch_satellites_background():
+    """Scarica i satelliti in un thread separato per non bloccare il boot."""
+    global SATELLITES
+    if not HAS_EPHEM:
+        return
+        
+    sat_list = [
+        ("ISS (ZARYA)", "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=tle"),
+        ("HST (Hubble)", "https://celestrak.org/NORAD/elements/gp.php?CATNR=20580&FORMAT=tle"),
+        ("CSS (Tiangong)", "https://celestrak.org/NORAD/elements/gp.php?CATNR=48274&FORMAT=tle")
+    ]
+    
+    temp_sats = []
+    for name, url in sat_list:
+        try:
+            logging.info(f"Recupero dati TLE per {name}...")
+            with urllib.request.urlopen(url, timeout=3) as response:
+                lines = response.read().decode('utf-8').splitlines()
+                if len(lines) >= 3:
+                    sat = ephem.readtle(name, lines[1].strip(), lines[2].strip())
+                    temp_sats.append({"name": name, "ephem": sat, "az": 0.0, "alt": 0.0, "mag": -2.0, "type": "satellite"})
+        except Exception:
+            logging.warning(f"Impossibile scaricare TLE per {name}. Salto satellite.")
+    
+    SATELLITES = temp_sats
+    logging.info(f"Caricamento satelliti completato. Totale: {len(SATELLITES)}")
+
+def update_celestial_positions(lat, lon):
+    if not HAS_EPHEM:
+        return
+    observer = ephem.Observer()
+    observer.lat = str(lat)
+    observer.lon = str(lon)
+    observer.elevation = 0
+    observer.date = datetime.datetime.now(datetime.timezone.utc)
+
+    for obj in CELESTIAL_CATALOG:
+        if obj["type"] in ["planet", "star", "deep_sky"] and obj["ephem"] is not None:
+            try:
+                obj["ephem"].compute(observer)
+                obj["az"] = math.degrees(obj["ephem"].az)
+                obj["alt"] = math.degrees(obj["ephem"].alt)
+            except Exception:
+                pass
+
+def update_satellite_positions(lat, lon):
+    if not HAS_EPHEM or not SATELLITES:
+        return
+    observer = ephem.Observer()
+    observer.lat = str(lat)
+    observer.lon = str(lon)
+    observer.elevation = 0
+    observer.date = datetime.datetime.now(datetime.timezone.utc)
+
+    for obj in SATELLITES:
+        if obj["ephem"] is not None:
+            try:
+                obj["ephem"].compute(observer)
+                obj["az"] = math.degrees(obj["ephem"].az)
+                obj["alt"] = math.degrees(obj["ephem"].alt)
+            except Exception:
+                pass
+
+def get_cpu_temperature():
+    try:
+        if os.path.exists('/sys/class/thermal/thermal_zone0/temp'):
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                return float(f.read().strip()) / 1000.0
+    except Exception:
+        pass
+    return None
+
+
+# ==========================================
+# 5. FUNZIONI DI PROIEZIONE E GRAFICA
+# ==========================================
+def project_az_alt(az, alt, yaw, pitch, cx, cy):
+    delta_az = (az - yaw + 180) % 360 - 180
+    delta_alt = alt - pitch
+    x = cx + (delta_az * PX_PER_DEG_X)
+    y = cy - (delta_alt * PX_PER_DEG_Y)
+    is_visible = (-50 <= x <= SCREEN_WIDTH + 50) and (-50 <= y <= SCREEN_HEIGHT + 50)
+    return int(x), int(y), is_visible, delta_az, delta_alt
+
+def draw_crosshair(surface, cx, cy, col):
+    pygame.draw.line(surface, col, (cx - 20, cy), (cx + 20, cy), 2)
+    pygame.draw.line(surface, col, (cx, cy - 20), (cx, cy + 20), 2)
+    pygame.draw.circle(surface, col, (cx, cy), 12, 1)
+
+def draw_offscreen_arrow(surface, delta_az, delta_alt, cx, cy, col):
+    angle = math.atan2(-delta_alt, delta_az)
+    margin = 40
+    arrow_x = int(cx + (cx - margin) * math.cos(angle))
+    arrow_y = int(cy + (cy - margin) * math.sin(angle))
+    arrow_x = max(margin, min(SCREEN_WIDTH - margin, arrow_x))
+    arrow_y = max(margin, min(SCREEN_HEIGHT - margin, arrow_y))
+
+    size = 14
+    p1 = (arrow_x + int(size * math.cos(angle)), arrow_y + int(size * math.sin(angle)))
+    p2 = (arrow_x + int(size * math.cos(angle + 2.5)), arrow_y + int(size * math.sin(angle + 2.5)))
+    p3 = (arrow_x + int(size * math.cos(angle - 2.5)), arrow_y + int(size * math.sin(angle - 2.5)))
+    
+    pygame.draw.polygon(surface, col, [p1, p2, p3])
+    pygame.draw.circle(surface, col, (arrow_x, arrow_y), 18, 1)
+
+def draw_compass(surface, yaw, colors):
+    cx, cy, radius = SCREEN_WIDTH - 90, SCREEN_HEIGHT - 90, 50
+    pygame.draw.circle(surface, colors["bg"], (cx, cy), radius)
+    pygame.draw.circle(surface, colors["hud"], (cx, cy), radius, 2)
+
+    n_lbl = font_small.render("N", True, colors["warn"])
+    s_lbl = font_small.render("S", True, colors["hud"])
+    e_lbl = font_small.render("E", True, colors["hud"])
+    w_lbl = font_small.render("W", True, colors["hud"])
+
+    surface.blit(n_lbl, (cx - n_lbl.get_width() // 2, cy - radius - 2))
+    surface.blit(s_lbl, (cx - s_lbl.get_width() // 2, cy + radius - 14))
+    surface.blit(e_lbl, (cx + radius - 14, cy - e_lbl.get_height() // 2))
+    surface.blit(w_lbl, (cx - radius + 2, cy - e_lbl.get_height() // 2))
+
+    angle_rad = math.radians(yaw - 90)
+    tip_x = cx + int((radius - 12) * math.cos(angle_rad))
+    tip_y = cy + int((radius - 12) * math.sin(angle_rad))
+    
+    pygame.draw.line(surface, colors["target"], (cx, cy), (tip_x, tip_y), 3)
+    pygame.draw.circle(surface, colors["target"], (cx, cy), 4)
+
+    val_txt = font_small.render(f"{int(yaw)}°", True, colors["hud"])
+    surface.blit(val_txt, (cx - val_txt.get_width() // 2, cy + radius + 4))
+
+def draw_telemetry(surface, yaw, pitch, lat, lon, gps_ok, target_obj, delta_az, delta_alt, cpu_temp, colors):
+    surface.blit(font_hud.render(f"YAW:   {yaw:05.1f}° (OFF: {state['yaw_offset']:+.1f}°)", True, colors["hud"]), (20, 20))
+    surface.blit(font_hud.render(f"PITCH: {pitch:05.1f}°", True, colors["hud"]), (20, 45))
+    
+    gps_str = "GPS: FIX OK" if gps_ok else "GPS: SEARCHING..."
+    gps_col = colors["hud"] if gps_ok else colors["warn"]
+    surface.blit(font_hud.render(gps_str, True, gps_col), (20, 70))
+
+    if cpu_temp is not None:
+        temp_col = colors["hud"] if cpu_temp < 65.0 else colors["orange"] if cpu_temp < 80.0 else colors["warn"]
+        surface.blit(font_hud.render(f"CPU: {cpu_temp:.1f}°C", True, temp_col), (20, 95))
+
+    surface.blit(font_hud.render(f"LAT: {lat:.4f}", True, colors["hud"]), (20, SCREEN_HEIGHT - 65))
+    surface.blit(font_hud.render(f"LON: {lon:.4f}", True, colors["hud"]), (20, SCREEN_HEIGHT - 40))
+
+    dist_angle = math.sqrt(delta_az**2 + delta_alt**2)
+    box_x = SCREEN_WIDTH - 380
+    surface.blit(font_big.render(f"TARGET: {target_obj['name'].upper()}", True, colors["target"]), (box_x, 20))
+    surface.blit(font_hud.render(f"AZ: {target_obj['az']:.1f}° | ALT: {target_obj['alt']:.1f}°", True, colors["target"]), (box_x, 50))
+    surface.blit(font_hud.render(f"DISTANCE: {dist_angle:.1f}°", True, colors["target"]), (box_x, 75))
+    surface.blit(font_small.render("[SPACE] Next | [C] Calib | [B] Cam | [N] Night | [R] Swap", True, colors["hud"]), (box_x, 105))
+
+
+# ==========================================
+# 6. INIZIALIZZAZIONE HARDWARE & GPIO
+# ==========================================
+bno = None
+if HAS_BNO055:
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        bno = adafruit_bno055.BNO055_I2C(i2c)
+    except Exception as e:
+        logging.error(f"BNO055 disabilitato: {e}")
+
+gps_serial = None
+if HAS_GPS:
+    try:
+        gps_serial = serial.Serial('/dev/ttyAMA0', baudrate=9600, timeout=0.5)
+    except Exception as e:
+        logging.error(f"GPS disabilitato: {e}")
+
+picam2 = None
+camera_width, camera_height = 1280, 720
+if HAS_PICAMERA2:
+    try:
+        picam2 = Picamera2()
+        # Usiamo il formato nativo BGR888 di Raspberry Pi
+        config = picam2.create_video_configuration(
+            main={"size": (camera_width, camera_height), "format": "BGR888"}
+        )
+        picam2.configure(config)
+        picam2.start()
+    except Exception as e:
+        logging.error(f"Inizializzazione Camera fallita: {e}")
+        HAS_PICAMERA2 = False
+
+# Avvio il thread in background per i satelliti (non blocca il boot)
+threading.Thread(target=fetch_satellites_background, daemon=True).start()
+
+raw_yaw = 0.0
+current_yaw = 0.0
+current_pitch = 0.0
+current_lat, current_lon = 42.3601, -71.0942
+gps_fix = False
+cpu_temperature = None
+
+if HAS_GPIO:
+    def handle_next_target():
+        state["target_index"] = (state["target_index"] + 1) % (len(CELESTIAL_CATALOG) + len(SATELLITES))
+
+    def handle_calibration():
+        target_az = (CELESTIAL_CATALOG + SATELLITES)[state["target_index"]]["az"]
+        state["yaw_offset"] = target_az - raw_yaw
+        state["calib_msg_frames"] = 90
+
+    def handle_toggle_camera():
+        state["show_camera"] = not state["show_camera"]
+
+    btn_next = Button(17, pull_up=True, bounce_time=0.1)
+    btn_next.when_pressed = handle_next_target
+
+    btn_calib = Button(27, pull_up=True, bounce_time=0.1)
+    btn_calib.when_pressed = handle_calibration
+
+    btn_toggle = Button(22, pull_up=True, bounce_time=0.1)
+    btn_toggle.when_pressed = handle_toggle_camera
+
+
+# ==========================================
+# 7. LOOP PRINCIPALE
+# ==========================================
+last_astro_update = 0
+last_sat_update = 0
+last_hw_update = 0
+last_blink_toggle = 0
+clock = pygame.time.Clock()
+running = True
+
+# Schermata di caricamento iniziale
+screen.fill((0,0,0))
+loading_text = font_big.render("CARICAMENTO STARGLASSES AR...", True, (0, 255, 0))
+screen.blit(loading_text, (SCREEN_WIDTH//2 - loading_text.get_width()//2, SCREEN_HEIGHT//2))
+pygame.display.flip()
+
+logging.info("StarGlasses AR - Avvio sistema completato.")
+
+try:
+    while running:
+        colors = get_colors()
+        now = time.time()
+
+        if now - last_blink_toggle >= 0.5:
+            state["sat_blink_toggle"] = not state["sat_blink_toggle"]
+            last_blink_toggle = now
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key in (pygame.K_SPACE, pygame.K_TAB):
+                    state["target_index"] = (state["target_index"] + 1) % (len(CELESTIAL_CATALOG) + len(SATELLITES))
+                elif event.key == pygame.K_c:
+                    target_az = (CELESTIAL_CATALOG + SATELLITES)[state["target_index"]]["az"]
+                    state["yaw_offset"] = target_az - raw_yaw
+                    state["calib_msg_frames"] = 90
+                elif event.key == pygame.K_b:
+                    state["show_camera"] = not state["show_camera"]
+                elif event.key == pygame.K_n:
+                    state["night_mode"] = not state["night_mode"]
+                elif event.key == pygame.K_r:
+                    # Tasto R per invertire i colori della camera se appaiono invertiti (effetto puffi)
+                    state["swap_colors"] = not state["swap_colors"]
+
+        if bno is not None:
+            try:
+                euler = bno.euler
+                if euler[0] is not None:
+                    raw_yaw = euler[0]
+                    current_yaw = (raw_yaw + state["yaw_offset"]) % 360
+                    current_pitch = euler[2]
+            except Exception:
+                pass
+
+        if gps_serial is not None and gps_serial.in_waiting > 0:
+            try:
+                line = gps_serial.readline().decode('ascii', errors='replace')
+                if line.startswith('$GPGGA') or line.startswith('$GNGGA'):
+                    msg = pynmea2.parse(line)
+                    if msg.gps_qual > 0:
+                        current_lat = msg.latitude
+                        current_lon = msg.longitude
+                        gps_fix = True
+            except Exception:
+                pass
+
+        if now - last_astro_update >= 5.0:
+            update_celestial_positions(current_lat, current_lon)
+            last_astro_update = now
+            
+        if now - last_sat_update >= 0.2:
+            update_satellite_positions(current_lat, current_lon)
+            last_sat_update = now
+
+        if now - last_hw_update >= 3.0:
+            cpu_temperature = get_cpu_temperature()
+            last_hw_update = now
+
+        if cpu_temperature is not None and cpu_temperature >= 85.0:
+            screen.fill(colors["bg"])
+            crit_text = font_big.render("CRITICAL TEMPERATURE - SHUTTING DOWN!", True, colors["warn"])
+            screen.blit(crit_text, (SCREEN_WIDTH // 2 - crit_text.get_width() // 2, SCREEN_HEIGHT // 2))
+            pygame.display.flip()
+            time.sleep(3.0)
+            running = False
+            break
+
+        # --- RENDERING VIDEO & HUD ---
+        if state["show_camera"] and HAS_PICAMERA2 and picam2 is not None:
+            try:
+                frame = picam2.capture_array()
+                
+                # Se l'opzione swap_colors è attiva, invertiamo i canali BGR in RGB
+                if state["swap_colors"]:
+                    frame = frame[:, :, ::-1]
+                
+                # Ora frame è in formato RGB standard. Indici: 0=Rosso, 1=Verde, 2=Blu
+                if state["night_mode"]:
+                    frame[:, :, 1] = 0  # Azzera il Verde
+                    frame[:, :, 2] = 0  # Azzera il Blu
+                
+                # Creiamo una copia contigua in memoria per Pygame
+                frame_contiguous = np.ascontiguousarray(frame)
+                
+                # Pygame leggerà il buffer come RGB puro
+                frame_surface_base = pygame.image.frombuffer(
+                    frame_contiguous.tobytes(), (camera_width, camera_height), "RGB"
+                )
+                
+                if (camera_width != SCREEN_WIDTH) or (camera_height != SCREEN_HEIGHT):
+                    camera_surface = pygame.transform.scale(frame_surface_base, (SCREEN_WIDTH, SCREEN_HEIGHT))
+                else:
+                    camera_surface = frame_surface_base
+                screen.blit(camera_surface, (0, 0))
+            except Exception as e:
+                logging.error(f"Errore cattura frame camera: {e}")
+                screen.fill(colors["bg"])
+        else:
+            screen.fill(colors["bg"])
+
+        cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+        
+        all_catalog = CELESTIAL_CATALOG + SATELLITES
+        
+        # Controllo di sicurezza sull'indice del target
+        if state["target_index"] >= len(all_catalog):
+            state["target_index"] = 0
+            
+        target_obj = all_catalog[state["target_index"]]
+        projected_positions = {}
+
+        for idx, obj in enumerate(all_catalog):
+            if obj["alt"] < -5.0:
+                continue
+
+            x, y, visible, d_az, d_alt = project_az_alt(
+                obj["az"], obj["alt"], current_yaw, current_pitch, cx, cy
+            )
+            
+            is_current_target = (idx == state["target_index"])
+
+            if visible:
+                projected_positions[obj["name"]] = (x, y)
+                mag = obj["mag"]
+                radius = max(2, int(5 - mag))
+
+                if is_current_target:
+                    pygame.draw.circle(screen, colors["target"], (x, y), radius + 8, 2)
+                    pygame.draw.rect(screen, colors["target"], (x - 12, y - 12, 24, 24), 1)
+                    txt_col = colors["target"]
+                
+                elif obj["type"] == "satellite":
+                    if state["sat_blink_toggle"]:
+                        size = 4
+                        pygame.draw.polygon(screen, colors["satellite"], [(x, y-size), (x+size, y), (x, y+size), (x-size, y)])
+                    txt_col = colors["satellite"]
+                    radius = 4 
+
+                elif obj["type"] == "planet":
+                    pygame.draw.circle(screen, colors["planet"], (x, y), radius + 2)
+                    pygame.draw.circle(screen, colors["orange"], (x, y), radius + 2, 1)
+                    txt_col = colors["planet"]
+
+                elif obj["type"] == "deep_sky":
+                    pygame.draw.circle(screen, colors["deep_sky"], (x, y), radius + 4, 1)
+                    pygame.draw.circle(screen, colors["deep_sky"], (x, y), radius + 2, 1)
+                    pygame.draw.circle(screen, colors["deep_sky"], (x, y), 1)
+                    txt_col = colors["deep_sky"]
+
+                else:
+                    pygame.draw.circle(screen, colors["star"], (x, y), radius)
+                    txt_col = colors["star"]
+
+                label = font_small.render(obj["name"], True, txt_col)
+                screen.blit(label, (x + radius + 6, y - 6))
+
+        for star1, star2 in CONSTELLATION_LINES:
+            if star1 in projected_positions and star2 in projected_positions:
+                pygame.draw.line(screen, colors["constellation"], projected_positions[star1], projected_positions[star2], 1)
+
+        for const_name, star_names in CONSTELLATION_GROUPS.items():
+            points = [projected_positions[s] for s in star_names if s in projected_positions]
+            if len(points) >= 2:
+                avg_x = sum(p[0] for p in points) // len(points)
+                avg_y = sum(p[1] for p in points) // len(points)
+                
+                const_lbl = font_const.render(const_name, True, colors["constellation_name"])
+                screen.blit(const_lbl, (avg_x - const_lbl.get_width() // 2, avg_y + 15))
+
+        _, _, target_visible, target_d_az, target_d_alt = project_az_alt(
+            target_obj["az"], target_obj["alt"], current_yaw, current_pitch, cx, cy
+        )
+        
+        if target_obj["alt"] < 0:
+            warning_msg = font_hud.render("TARGET BELOW HORIZON", True, colors["warn"])
+            screen.blit(warning_msg, (cx - warning_msg.get_width() // 2, cy + 40))
+        elif not target_visible:
+            draw_offscreen_arrow(screen, target_d_az, target_d_alt, cx, cy, colors["target"])
+
+        draw_crosshair(screen, cx, cy, colors["hud"])
+        draw_compass(screen, current_yaw, colors)
+        draw_telemetry(
+            screen, current_yaw, current_pitch, 
+            current_lat, current_lon, gps_fix, target_obj, target_d_az, target_d_alt, cpu_temperature, colors
+        )
+
+        if state["calib_msg_frames"] > 0:
+            msg_text = font_big.render(f"IMU ALIGNED TO: {target_obj['name'].upper()}", True, colors["target"])
+            screen.blit(msg_text, (SCREEN_WIDTH // 2 - msg_text.get_width() // 2, SCREEN_HEIGHT - 120))
+            state["calib_msg_frames"] -= 1
+
+        pygame.display.flip()
+        clock.tick(30)
+
+except KeyboardInterrupt:
+    logging.info("Interruzione manuale rilevata.")
+finally:
+    logging.info("Arresto sistema in corso...")
+    if picam2:
+        picam2.stop()
+    if gps_serial:
+        gps_serial.close()
+    pygame.quit()
+    sys.exit(0)
