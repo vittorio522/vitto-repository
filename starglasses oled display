@@ -1,0 +1,219 @@
+import sys
+import pygame
+import numpy as np
+import time
+import math
+import serial
+import datetime
+import os
+import logging
+
+# ==========================================
+# DRIVER DISPLAY TRASPARENTE
+# ==========================================
+from luma.core.interface.serial import spi
+from luma.oled.device import ssd1309
+from PIL import Image
+
+try:
+    serial_spi = spi(port=0, device=0, gpio_DC=24, gpio_RST=25)
+    oled_device = ssd1309(serial_spi, width=128, height=64, rotate=0)
+    HAS_OLED = True
+except Exception as e:
+    HAS_OLED = False
+    logging.error(f"OLED Error: {e}")
+
+try:
+    import ephem
+    HAS_EPHEM = True
+except ModuleNotFoundError:
+    HAS_EPHEM = False
+
+try:
+    import board
+    import busio
+    import adafruit_bno055
+    HAS_BNO055 = True
+except ModuleNotFoundError:
+    HAS_BNO055 = False
+
+try:
+    from gpiozero import Button
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
+
+
+# ==========================================
+# CONFIGURAZIONE GRAFICA (NETTA E LEGGIBILE)
+# ==========================================
+pygame.init()
+
+SCREEN_WIDTH = 128
+SCREEN_HEIGHT = 64
+
+os.environ["SDL_VIDEODRIVER"] = "dummy"
+screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+
+# Font monospaziato senza antialiasing per massima nitidezza a 1-bit
+font_hud = pygame.font.SysFont("monospace", 10, bold=True)
+font_big = pygame.font.SysFont("monospace", 12, bold=True)
+
+FOV_HORIZ_DEG = 35.0
+FOV_VERT_DEG = 18.0
+PX_PER_DEG_X = SCREEN_WIDTH / FOV_HORIZ_DEG
+PX_PER_DEG_Y = SCREEN_HEIGHT / FOV_VERT_DEG
+
+# ==========================================
+# STATO & CALIBRAZIONE
+# ==========================================
+state = {
+    "target_index": 0,
+    "yaw_offset": 0.0,
+    "calib_timer": 0
+}
+
+CELESTIAL_CATALOG = [
+    {"name": "MARS", "ephem": ephem.Mars() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "JUPI", "ephem": ephem.Jupiter() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "SATU", "ephem": ephem.Saturn() if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "SIRI", "ephem": ephem.star('Sirius') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "BETE", "ephem": ephem.star('Betelgeuse') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "VEGA", "ephem": ephem.star('Vega') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+    {"name": "POLA", "ephem": ephem.star('Polaris') if HAS_EPHEM else None, "az": 0.0, "alt": 0.0},
+]
+
+def update_positions(lat=42.36, lon=-71.09):
+    if not HAS_EPHEM: return
+    observer = ephem.Observer()
+    observer.lat, observer.lon = str(lat), str(lon)
+    observer.date = datetime.datetime.now(datetime.timezone.utc)
+    for obj in CELESTIAL_CATALOG:
+        if obj["ephem"]:
+            try:
+                obj["ephem"].compute(observer)
+                obj["az"] = math.degrees(obj["ephem"].az)
+                obj["alt"] = math.degrees(obj["ephem"].alt)
+            except Exception: pass
+
+# ==========================================
+# HARDWARE & PULSANTI
+# ==========================================
+bno = None
+if HAS_BNO055:
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        bno = adafruit_bno055.BNO055_I2C(i2c)
+    except Exception as e: logging.error(f"BNO Error: {e}")
+
+raw_yaw, current_yaw, current_pitch = 0.0, 0.0, 0.0
+
+if HAS_GPIO:
+    btn_next = Button(17, pull_up=True, bounce_time=0.1)
+    btn_calib = Button(27, pull_up=True, bounce_time=0.1)
+    
+    btn_next.when_pressed = lambda: state.update({"target_index": (state["target_index"] + 1) % len(CELESTIAL_CATALOG)})
+    btn_calib.when_pressed = lambda: state.update({"yaw_offset": -raw_yaw, "calib_timer": 30})
+
+
+# ==========================================
+# LOOP PRINCIPALE
+# ==========================================
+clock = pygame.time.Clock()
+last_astro = 0
+
+try:
+    while True:
+        now = time.time()
+
+        for event in pygame.event.get():
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_SPACE:
+                    state["target_index"] = (state["target_index"] + 1) % len(CELESTIAL_CATALOG)
+                elif event.key == pygame.K_c: # CALIBRAZIONE YAW
+                    state["yaw_offset"] = -raw_yaw
+                    state["calib_timer"] = 30
+
+        # Lettura IMU
+        if bno:
+            try:
+                euler = bno.euler
+                if euler[0] is not None:
+                    raw_yaw = euler[0]
+                    current_yaw = (raw_yaw + state["yaw_offset"]) % 360
+                    current_pitch = euler[2]
+            except Exception: pass
+
+        if now - last_astro > 5.0:
+            update_positions()
+            last_astro = now
+
+        # --- RENDERING ---
+        screen.fill((0, 0, 0))
+        cx, cy = SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2
+
+        # Mirino centrale
+        pygame.draw.line(screen, (255, 255, 255), (cx - 3, cy), (cx + 3, cy), 1)
+        pygame.draw.line(screen, (255, 255, 255), (cx, cy - 3), (cx, cy + 3), 1)
+
+        target_obj = CELESTIAL_CATALOG[state["target_index"]]
+
+        # Render delle stelle CONI NOMI
+        for idx, obj in enumerate(CELESTIAL_CATALOG):
+            if obj["alt"] < 0: continue
+            
+            delta_az = (obj["az"] - current_yaw + 180) % 360 - 180
+            delta_alt = obj["alt"] - current_pitch
+            x = int(cx + (delta_az * PX_PER_DEG_X))
+            y = int(cy - (delta_alt * PX_PER_DEG_Y))
+
+            if 0 <= x <= SCREEN_WIDTH and 0 <= y <= SCREEN_HEIGHT:
+                is_target = (idx == state["target_index"])
+                
+                # Disegno punto o riquadro target
+                if is_target:
+                    pygame.draw.rect(screen, (255, 255, 255), (x - 3, y - 3, 7, 7), 1)
+                else:
+                    pygame.draw.circle(screen, (255, 255, 255), (x, y), 1)
+
+                # NOME DELLA STELLA (A fianco del punto)
+                lbl = font_hud.render(obj["name"][:4], False, (255, 255, 255))
+                lbl_x = x + 3
+                lbl_y = y - 4
+                
+                # Controllo per non far uscire il testo dallo schermo
+                if lbl_x + lbl.get_width() > SCREEN_WIDTH:
+                    lbl_x = x - lbl.get_width() - 2
+                if lbl_y < 0:
+                    lbl_y = 0
+                    
+                screen.blit(lbl, (lbl_x, lbl_y))
+
+        # TELEMETRIA HUD
+        txt_pos = font_hud.render(f"{int(current_yaw)}°/{int(current_pitch)}°", False, (255, 255, 255))
+        screen.blit(txt_pos, (1, 0))
+
+        txt_tgt = font_hud.render(f"TGT:{target_obj['name'][:4]}", False, (255, 255, 255))
+        screen.blit(txt_tgt, (SCREEN_WIDTH - txt_tgt.get_width() - 1, 0))
+
+        # Messaggio di Calibrazione
+        if state["calib_timer"] > 0:
+            txt_cal = font_big.render("CALIBRATED!", False, (255, 255, 255))
+            screen.blit(txt_cal, (cx - txt_cal.get_width() // 2, SCREEN_HEIGHT - 12))
+            state["calib_timer"] -= 1
+
+        # Conversione soglia netta 1-bit
+        if HAS_OLED:
+            raw_str = pygame.image.tostring(screen, "RGB")
+            pil_img = Image.frombytes("RGB", (SCREEN_WIDTH, SCREEN_HEIGHT), raw_str).convert("L")
+            pil_img = pil_img.point(lambda p: 255 if p > 80 else 0).convert("1")
+            oled_device.display(pil_img)
+
+        clock.tick(20)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    if HAS_OLED: oled_device.clear()
+    pygame.quit()
+    sys.exit(0)
