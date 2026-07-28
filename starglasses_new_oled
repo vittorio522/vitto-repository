@@ -1,0 +1,569 @@
+import sys, os, time, math, datetime, logging
+import pygame
+from dataclasses import dataclass
+from typing import Any, List, Dict, Tuple
+
+from luma.core.interface.serial import spi
+from luma.oled.device import ssd1309
+from PIL import Image
+
+# ---------- Optional deps ----------
+try:
+    import ephem
+    HAS_EPHEM = True
+except ModuleNotFoundError:
+    HAS_EPHEM = False
+
+try:
+    import board, busio, adafruit_bno055
+    HAS_BNO055 = True
+except ModuleNotFoundError:
+    HAS_BNO055 = False
+
+try:
+    from gpiozero import Button
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+# Render nativo 128x64 per OLED perfetto
+SCREEN_W, SCREEN_H     = 128, 64  
+FOV_H_DEG, FOV_V_DEG   = 35.0, 18.0
+PX_PER_DEG_X           = SCREEN_W / FOV_H_DEG
+PX_PER_DEG_Y           = SCREEN_H / FOV_V_DEG
+LAT, LON               = 42.36, -71.09
+ASTRO_REFRESH          = 5.0
+FPS                    = 30
+TOP_H, BOT_H           = 10, 10     # Altezza barre HUD
+
+os.environ["SDL_VIDEO_CENTERED"] = "1"
+pygame.init()
+
+# Finestra desktop 5x (640x320) con pixel nitidi
+SCALE = 5
+MONITOR_W, MONITOR_H = SCREEN_W * SCALE, SCREEN_H * SCALE
+window = pygame.display.set_mode((MONITOR_W, MONITOR_H))
+pygame.display.set_caption("Star Tracker HUD - Native 1-Bit Render")
+
+# Superficie di render interna (128x64)
+screen = pygame.Surface((SCREEN_W, SCREEN_H))
+
+FONT_TINY = pygame.font.SysFont("monospace", 8, bold=True)
+FONT_HUD  = pygame.font.SysFont("monospace", 10, bold=True)
+FONT_BIG  = pygame.font.SysFont("monospace", 14, bold=True)
+
+# ---------- OLED ----------
+try:
+    _spi = spi(port=0, device=0, gpio_DC=24, gpio_RST=25)
+    oled = ssd1309(_spi, width=128, height=64, rotate=0)
+    HAS_OLED = True
+except Exception as e:
+    HAS_OLED = False
+    logging.error(f"OLED init failed (running in desktop mode only): {e}")
+
+
+# ============================================================
+# DATA MODEL
+# ============================================================
+@dataclass
+class CelestialObj:
+    name: str
+    short: str
+    kind: str            # 'star' | 'planet' | 'dso'
+    mag: float
+    body: Any = None
+    az: float = 0.0
+    alt: float = 0.0
+    visible: bool = False
+    sub: str = ""        # 'Pln' / 'Gal' / 'Neb' / 'Clu'
+
+CATALOG: List[CelestialObj] = []
+BY_NAME: Dict[str, CelestialObj] = {}
+
+def _add(o: CelestialObj):
+    CATALOG.append(o)
+    BY_NAME[o.name] = o
+
+if HAS_EPHEM:
+    # ----- Planets -----
+    planets = [
+        ("Mercury","MERC", ephem.Mercury, -0.4, "Pln"),
+        ("Venus",  "VEN",  ephem.Venus,   -4.0, "Pln"),
+        ("Mars",   "MARS", ephem.Mars,    -2.0, "Pln"),
+        ("Jupiter","JUPI", ephem.Jupiter, -2.5, "Pln"),
+        ("Saturn", "SATU", ephem.Saturn,  -0.5, "Pln"),
+        ("Uranus", "URAN", ephem.Uranus,   5.7, "Pln"),
+        ("Neptune","NEPT", ephem.Neptune,  7.8, "Pln"),
+    ]
+    for name, short, klass, mag, sub in planets:
+        _add(CelestialObj(name, short, "planet", mag, body=klass(), sub=sub))
+
+    # ----- Bright named stars -----
+    stars = [
+        ("Sirius",     "SIRI",-1.46), ("Canopus",    "CANO",-0.74),
+        ("Arcturus",   "ARCT",-0.05), ("Vega",       "VEGA", 0.03),
+        ("Capella",    "CAPE", 0.08), ("Rigel",      "RIGE", 0.13),
+        ("Procyon",    "PROC", 0.34), ("Betelgeuse", "BETE", 0.42),
+        ("Altair",     "ALTA", 0.77), ("Aldebaran",  "ALDE", 0.85),
+        ("Antares",    "ANT",  1.06), ("Spica",      "SPIC", 1.04),
+        ("Pollux",     "POLL", 1.14), ("Fomalhaut",  "FORM", 1.16),
+        ("Deneb",      "DENE", 1.25), ("Regulus",    "REGU", 1.35),
+        ("Castor",     "CAST", 1.58), ("Polaris",    "POLA", 1.97),
+        ("Bellatrix",  "BELL", 1.64), ("Mintaka",    "MINT", 2.23),
+        ("Alnilam",    "ALNI", 1.69), ("Alnitak",    "ALNZ", 1.74),
+        ("Saiph",      "SAIP", 2.09), ("Dubhe",      "DUBH", 1.79),
+        ("Merak",      "MERA", 2.37), ("Phecda",     "PHEC", 2.44),
+        ("Megrez",     "MEGR", 3.31), ("Alioth",     "ALIO", 1.76),
+        ("Mizar",      "MIZA", 2.27), ("Alkaid",     "ALKA", 1.85),
+        ("Caph",       "CAPH", 2.27), ("Schedar",    "SCHE", 2.24),
+        ("Ruchbah",    "RUCH", 2.68), ("Segin",      "SEGI", 3.38),
+        ("Algol",      "ALGO", 2.12), ("Hamal",      "HAMA", 2.00),
+        ("Mirfak",     "MIRF", 1.79), ("Denebola",   "DENB", 2.14),
+    ]
+    for name, short, mag in stars:
+        try:
+            _add(CelestialObj(name, short, "star", mag, body=ephem.star(name)))
+        except Exception as e:
+            logging.warning(f"Skip star {name}: {e}")
+
+    # ----- Deep-sky objects (Messier) -----
+    dsos = [
+        ("M31 Andromeda","M31","0:42:44.3",  "+41:16:09", 3.4, "Gal"),
+        ("M42 Orion Neb","M42","5:35:17.3",  "-5:23:28",  4.0, "Neb"),
+        ("M45 Pleiades", "M45","3:47:24.0",  "+24:07:00", 1.6, "Clu"),
+        ("M44 Beehive",  "M44","8:40:24.0",  "+19:59:00", 3.7, "Clu"),
+        ("M13 Hercules", "M13","16:41:41.6", "+36:27:35", 5.8, "Clu"),
+        ("M57 Ring Neb", "M57","18:53:35.1", "+33:01:45", 8.8, "Neb"),
+        ("M81 Bode",     "M81","9:55:33.2",  "+69:03:55", 6.9, "Gal"),
+        ("M51 Whirlpool","M51","13:29:52.7", "+47:11:43", 8.4, "Gal"),
+    ]
+    for name, short, ra, dec, mag, sub in dsos:
+        fb = ephem.FixedBody()
+        fb._ra  = ephem.hours(ra)
+        fb._dec = ephem.degrees(dec)
+        _add(CelestialObj(name, short, "dso", mag, body=fb, sub=sub))
+
+
+# ============================================================
+# CONSTELLATION LINES (by star name)
+# ============================================================
+CONSTELLATION_LINES: List[Tuple[str, str]] = [
+    # Orion
+    ("Betelgeuse","Bellatrix"), ("Bellatrix","Mintaka"),
+    ("Mintaka","Alnilam"),      ("Alnilam","Alnitak"),
+    ("Alnitak","Saiph"),        ("Saiph","Rigel"),
+    ("Rigel","Mintaka"),        ("Betelgeuse","Alnitak"),
+    # Big Dipper (UMa)
+    ("Dubhe","Merak"),   ("Merak","Phecda"), ("Phecda","Megrez"),
+    ("Megrez","Dubhe"),  ("Megrez","Alioth"),("Alioth","Mizar"),
+    ("Mizar","Alkaid"),
+    # Cassiopeia W
+    ("Caph","Schedar"), ("Schedar","Ruchbah"), ("Ruchbah","Segin"),
+    # Leo
+    ("Regulus","Denebola"),
+]
+
+
+# ============================================================
+# STATE
+# ============================================================
+state = {
+    "target_index": 0,
+    "yaw_offset":   0.0,
+    "pitch_offset": 0.0,
+    "calib_timer":  0,
+    "msg_text":     "",
+    "msg_timer":    0,
+    "show_const":   True,
+    "show_dso":     True,
+    "show_label":   True,
+    "filter_mag":   5.0,
+    "last_astro":   0.0,
+    "blink":        0,
+    "mode":         "TRK",
+    "raw_yaw":      0.0,
+    "current_yaw":  10.0,
+    "current_pitch":20.0,
+    "current_roll": 0.0,
+}
+
+def next_target():
+    if CATALOG:
+        state["target_index"] = (state["target_index"] + 1) % len(CATALOG)
+
+def do_calibrate():
+    state["yaw_offset"]   = -state["raw_yaw"]
+    state["pitch_offset"] = -state["current_pitch"]
+    state["calib_timer"]  = 40
+
+def show_message(text):
+    state["msg_text"] = text
+    state["msg_timer"] = 30
+
+
+# ============================================================
+# HARDWARE
+# ============================================================
+bno = None
+if HAS_BNO055:
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        bno = adafruit_bno055.BNO055_I2C(i2c)
+    except Exception as e:
+        logging.error(f"BNO init: {e}")
+
+if HAS_GPIO:
+    try:
+        btn_next  = Button(17, pull_up=True, bounce_time=0.1)
+        btn_calib = Button(27, pull_up=True, bounce_time=0.1)
+        btn_next.when_pressed  = next_target
+        btn_calib.when_pressed = do_calibrate
+    except Exception as e:
+        logging.error(f"GPIO init: {e}")
+
+
+# ============================================================
+# ASTRO UPDATE
+# ============================================================
+def update_positions():
+    if not HAS_EPHEM: return
+    obs = ephem.Observer()
+    obs.lat, obs.lon = str(LAT), str(LON)
+    obs.date = datetime.datetime.now(datetime.timezone.utc)
+    obs.horizon = "-1:00"      # atmospheric refraction
+    for o in CATALOG:
+        try:
+            o.body.compute(obs)
+            o.az  = math.degrees(o.body.az)
+            o.alt = math.degrees(o.body.alt)
+            o.visible = o.alt > -1
+        except Exception:
+            o.visible = False
+
+
+# ============================================================
+# PROJECTION
+# ============================================================
+def project(az, alt):
+    d_az  = ((az - state["current_yaw"] + 180) % 360) - 180
+    d_alt = alt - state["current_pitch"]
+    x = SCREEN_W * 0.5 + d_az  * PX_PER_DEG_X
+    y = SCREEN_H * 0.5 - d_alt * PX_PER_DEG_Y
+    return x, y
+
+def in_view(x, y, m=4):
+    return -m <= x <= SCREEN_W + m and -m <= y <= SCREEN_H + m
+
+
+# ============================================================
+# 1-BIT DRAW HELPERS
+# ============================================================
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+
+def _px(surf, x, y):
+    if 0 <= x < SCREEN_W and 0 <= y < SCREEN_H:
+        surf.set_at((x, y), WHITE)
+
+def dashed_line(surf, p1, p2, dash=2, gap=1):
+    x1, y1 = p1; x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    dist = math.hypot(dx, dy)
+    if dist < 1: return
+    ux, uy = dx / dist, dy / dist
+    d = 0
+    while d < dist:
+        d_end = min(d + dash, dist)
+        sx, sy = x1 + ux * d, y1 + uy * d
+        ex, ey = x1 + ux * d_end, y1 + uy * d_end
+        pygame.draw.line(surf, WHITE, (sx, sy), (ex, ey))
+        d += dash + gap
+
+def draw_dashed_circle(surf, cx, cy, r, segs=8):
+    for i in range(segs):
+        if i % 2 == 0: continue
+        a1 = (i / segs) * 2 * math.pi
+        a2 = ((i + 1) / segs) * 2 * math.pi
+        x1 = cx + math.cos(a1) * r; y1 = cy + math.sin(a1) * r
+        x2 = cx + math.cos(a2) * r; y2 = cy + math.sin(a2) * r
+        pygame.draw.line(surf, WHITE, (x1, y1), (x2, y2))
+
+def draw_star(surf, x, y, mag):
+    """Magnitude-aware star rendering ottimizzato per 128x64."""
+    if mag < 0:
+        # Stellata (plus shape)
+        for d in range(-2, 3):
+            _px(surf, x + d, y); _px(surf, x, y + d)
+    elif mag < 1.5:
+        # 2x2 pixel
+        _px(surf, x, y); _px(surf, x+1, y)
+        _px(surf, x, y+1); _px(surf, x+1, y+1)
+    elif mag < 2.8:
+        _px(surf, x, y)
+    else:
+        _px(surf, x, y)
+
+def draw_corner_brackets():
+    bl = 6
+    yt, yb = TOP_H, SCREEN_H - BOT_H - 1
+    pygame.draw.line(screen, WHITE, (0, yt), (bl, yt))
+    pygame.draw.line(screen, WHITE, (0, yt), (0, yt + bl))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yt), (SCREEN_W - 1 - bl, yt))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yt), (SCREEN_W - 1, yt + bl))
+    pygame.draw.line(screen, WHITE, (0, yb), (bl, yb))
+    pygame.draw.line(screen, WHITE, (0, yb), (0, yb - bl))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yb), (SCREEN_W - 1 - bl, yb))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yb), (SCREEN_W - 1, yb - bl))
+
+def draw_offscreen_arrow(tx, ty):
+    cx, cy = SCREEN_W // 2, SCREEN_H // 2
+    dx, dy = tx - cx, ty - cy
+    ang = math.atan2(dy, dx)
+    rx = SCREEN_W / 2 - 12
+    ry = SCREEN_H / 2 - 14
+    sx = abs(math.cos(ang)) or 1e-6
+    sy = abs(math.sin(ang)) or 1e-6
+    scale = min(rx / sx, ry / sy)
+    ix = int(cx + math.cos(ang) * scale)
+    iy = int(cy + math.sin(ang) * scale)
+    head = 4
+    a1 = ang + math.pi - 0.5
+    a2 = ang + math.pi + 0.5
+    pygame.draw.line(screen, WHITE, (ix, iy),
+                     (int(ix + math.cos(a1) * head), int(iy + math.sin(a1) * head)))
+    pygame.draw.line(screen, WHITE, (ix, iy),
+                     (int(ix + math.cos(a2) * head), int(iy + math.sin(a2) * head)))
+
+
+# ============================================================
+# RENDER
+# ============================================================
+def render():
+    screen.fill(BLACK)
+    cx, cy = SCREEN_W // 2, SCREEN_H // 2
+    view_top = TOP_H
+    view_bot = SCREEN_H - BOT_H
+
+    # 1. Compass ticks
+    for deg, lbl in [(0, "N"), (90, "E"), (180, "S"), (270, "W")]:
+        dx = ((deg - state["current_yaw"] + 180) % 360) - 180
+        if abs(dx) < FOV_H_DEG * 0.6:
+            x = int(cx + dx * PX_PER_DEG_X)
+            pygame.draw.line(screen, WHITE, (x, view_top + 1), (x, view_top + 4))
+            t = FONT_TINY.render(lbl, False, WHITE)
+            screen.blit(t, (x - t.get_width() // 2, view_top + 5))
+
+    # 2. Corner brackets
+    draw_corner_brackets()
+
+    # 3. Constellation lines
+    if state["show_const"]:
+        for a, b in CONSTELLATION_LINES:
+            oa = BY_NAME.get(a); ob = BY_NAME.get(b)
+            if not oa or not ob: continue
+            if oa.alt < -2 or ob.alt < -2: continue
+            x1, y1 = project(oa.az, oa.alt)
+            x2, y2 = project(ob.az, ob.alt)
+            if not (in_view(x1, y1, 60) or in_view(x2, y2, 60)):
+                continue
+            dashed_line(screen, (x1, y1), (x2, y2), dash=2, gap=1)
+
+    # 4. Celestial objects
+    for idx, o in enumerate(CATALOG):
+        if o.kind == "dso" and not state["show_dso"]: continue
+        if o.alt < -1: continue
+        if o.mag > state["filter_mag"]: continue
+        x, y = project(o.az, o.alt)
+        if not in_view(x, y): continue
+        ix, iy = int(x), int(y)
+        is_target = (idx == state["target_index"])
+
+        if o.kind == "dso":
+            draw_dashed_circle(screen, ix, iy, 3)
+        elif o.kind == "planet":
+            draw_star(screen, ix, iy, 0.0)
+            draw_dashed_circle(screen, ix, iy, 3)
+        else:
+            draw_star(screen, ix, iy, o.mag)
+
+        # Target reticle (blinking)
+        if is_target and (state["blink"] // 8) % 2 == 0:
+            pygame.draw.rect(screen, WHITE, (ix - 5, iy - 5, 11, 11), 1)
+            pygame.draw.line(screen, WHITE, (ix - 7, iy - 7), (ix - 5, iy - 5))
+            pygame.draw.line(screen, WHITE, (ix + 5, iy - 7), (ix + 7, iy - 5))
+            pygame.draw.line(screen, WHITE, (ix - 7, iy + 7), (ix - 5, iy + 5))
+            pygame.draw.line(screen, WHITE, (ix + 5, iy + 7), (ix + 7, iy + 5))
+
+        # Labels
+        if state["show_label"] and (o.kind != "star" or o.mag < 1.5 or is_target):
+            lbl = FONT_TINY.render(o.short, False, WHITE)
+            lx, ly = ix + 4, iy - 4
+            if lx + lbl.get_width() > SCREEN_W - 1:
+                lx = ix - lbl.get_width() - 4
+            if ly < view_top + 1: ly = view_top + 1
+            if ly + lbl.get_height() > view_bot - 1:
+                ly = view_bot - 1 - lbl.get_height()
+            screen.blit(lbl, (lx, ly))
+
+    # 5. Off-screen target arrow
+    tgt = CATALOG[state["target_index"]] if CATALOG else None
+    if tgt and tgt.alt >= -1:
+        tx, ty = project(tgt.az, tgt.alt)
+        if not (0 <= tx < SCREEN_W and view_top <= ty < view_bot):
+            draw_offscreen_arrow(tx, ty)
+
+    # 6. Center crosshair
+    pygame.draw.line(screen, WHITE, (cx - 5, cy), (cx - 2, cy))
+    pygame.draw.line(screen, WHITE, (cx + 2, cy), (cx + 5, cy))
+    pygame.draw.line(screen, WHITE, (cx, cy - 5), (cx, cy - 2))
+    pygame.draw.line(screen, WHITE, (cx, cy + 2), (cx, cy + 5))
+
+    # 7. Top HUD bar
+    pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_W, TOP_H))
+    pygame.draw.line(screen, WHITE, (0, TOP_H), (SCREEN_W, TOP_H))
+
+    yaw_s = f"Y{int(state['current_yaw']) % 360:03d}"
+    pit_s = f"P{int(state['current_pitch']):+03d}"
+    rol_s = f"R{int(state['current_roll']):+02d}"
+    hud_l = FONT_TINY.render(f"{yaw_s} {pit_s} {rol_s}", False, WHITE)
+    screen.blit(hud_l, (1, 1))
+
+    if tgt:
+        hud_r = FONT_TINY.render(tgt.short, False, WHITE)
+        screen.blit(hud_r, (SCREEN_W - hud_r.get_width() - 1, 1))
+
+    # 8. Bottom HUD bar
+    pygame.draw.line(screen, WHITE, (0, view_bot), (SCREEN_W, view_bot))
+    pygame.draw.rect(screen, BLACK, (0, view_bot + 1, SCREEN_W, BOT_H - 1))
+
+    if tgt:
+        v_flag = "OK" if tgt.visible else "--"
+        info = f"{tgt.short} {tgt.alt:+04.0f}/{tgt.az:03.0f} {v_flag}"
+        screen.blit(FONT_TINY.render(info, False, WHITE), (1, view_bot + 2))
+
+    mode_lbl = FONT_TINY.render(state["mode"], False, WHITE)
+    screen.blit(mode_lbl, (SCREEN_W - mode_lbl.get_width() - 1, view_bot + 2))
+
+    mag_lbl = FONT_TINY.render(f"m{state['filter_mag']:.1f}", False, WHITE)
+    screen.blit(mag_lbl, (SCREEN_W // 2 - mag_lbl.get_width() // 2, view_bot + 2))
+
+    # 9. Calibration banner
+    if state["calib_timer"] > 0:
+        msg = FONT_BIG.render("CALIBRATED", False, WHITE)
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        pygame.draw.rect(screen, BLACK, (bx - 3, by - 2, msg.get_width() + 6, msg.get_height() + 4))
+        pygame.draw.rect(screen, WHITE, (bx - 3, by - 2, msg.get_width() + 6, msg.get_height() + 4), 1)
+        screen.blit(msg, (bx, by))
+        state["calib_timer"] -= 1
+
+    # 10. Messaggi a schermo (feedback tasti)
+    if state["msg_timer"] > 0:
+        msg = FONT_BIG.render(state["msg_text"], False, WHITE)
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        pygame.draw.rect(screen, BLACK, (bx - 3, by - 2, msg.get_width() + 6, msg.get_height() + 4))
+        pygame.draw.rect(screen, WHITE, (bx - 3, by - 2, msg.get_width() + 6, msg.get_height() + 4), 1)
+        screen.blit(msg, (bx, by))
+        state["msg_timer"] -= 1
+
+    state["blink"] = (state["blink"] + 1) % 60
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+clock = pygame.time.Clock()
+
+print("=== Star Tracker HUD ===")
+print("Controlli (clicca sulla finestra per attivarli):")
+print(" SPAZIO : Prossimo bersaglio")
+print(" C      : Calibra")
+print(" L      : Toggle Etichette")
+print(" N      : Toggle DSO (Nebulose/Galassie)")
+print(" O      : Toggle Costellazioni")
+print(" SU/GIU : Filtro Magnitudine")
+if not bno:
+    print(" WASD   : Muovi visuale (Simulazione PC)")
+    print(" Q/E    : Ruota visuale (Simulazione PC)")
+
+try:
+    while True:
+        now = time.time()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_SPACE:
+                    next_target()
+                elif ev.key == pygame.K_c:
+                    do_calibrate()
+                elif ev.key == pygame.K_l:
+                    state["show_label"] = not state["show_label"]
+                    show_message(f"LABELS: {'ON' if state['show_label'] else 'OFF'}")
+                elif ev.key == pygame.K_n:
+                    state["show_dso"] = not state["show_dso"]
+                    show_message(f"DSO: {'ON' if state['show_dso'] else 'OFF'}")
+                elif ev.key == pygame.K_o:
+                    state["show_const"] = not state["show_const"]
+                    show_message(f"CONST: {'ON' if state['show_const'] else 'OFF'}")
+                elif ev.key == pygame.K_UP:
+                    state["filter_mag"] = min(8.0, state["filter_mag"] + 0.5)
+                    show_message(f"MAG <= {state['filter_mag']:.1f}")
+                elif ev.key == pygame.K_DOWN:
+                    state["filter_mag"] = max(1.0, state["filter_mag"] - 0.5)
+                    show_message(f"MAG <= {state['filter_mag']:.1f}")
+
+        # ---- IMU / Desktop Sim Controls ----
+        if bno:
+            try:
+                e = bno.euler
+                if e[0] is not None:
+                    state["raw_yaw"]       = e[0]
+                    state["current_yaw"]   = (state["raw_yaw"] + state["yaw_offset"]) % 360
+                    state["current_pitch"] = (e[2] or 0.0) + state["pitch_offset"]
+                    state["current_roll"]  = (e[1] or 0.0)
+            except Exception:
+                pass
+        else:
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_a]: state["current_yaw"] = (state["current_yaw"] - 1.5) % 360
+            if keys[pygame.K_d]: state["current_yaw"] = (state["current_yaw"] + 1.5) % 360
+            if keys[pygame.K_w]: state["current_pitch"] = min(90, state["current_pitch"] + 1.0)
+            if keys[pygame.K_s]: state["current_pitch"] = max(-90, state["current_pitch"] - 1.0)
+            if keys[pygame.K_q]: state["current_roll"] = max(-90, state["current_roll"] - 1.0)
+            if keys[pygame.K_e]: state["current_roll"] = min(90, state["current_roll"] + 1.0)
+
+        # ---- Astro refresh ----
+        if now - state["last_astro"] > ASTRO_REFRESH:
+            update_positions()
+            state["last_astro"] = now
+
+        # ---- Render ----
+        render()
+        
+        # Push to OLED (Nativo 128x64, no downscale, massima nitidezza)
+        if HAS_OLED:
+            raw = pygame.image.tostring(screen, "RGB")
+            pil_img = Image.frombytes("RGB", (SCREEN_W, SCREEN_H), raw).convert("L")
+            pil_img = pil_img.point(lambda p: 255 if p > 80 else 0).convert("1")
+            oled.display(pil_img)
+            
+        # Push to Desktop Window (Scale Nearest Neighbor per pixel art perfetta sul PC)
+        scaled_surf = pygame.transform.scale(screen, (MONITOR_W, MONITOR_H))
+        window.blit(scaled_surf, (0, 0))
+        pygame.display.flip()
+        
+        clock.tick(FPS)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    if HAS_OLED: oled.clear()
+    pygame.quit()
+    sys.exit(0)
