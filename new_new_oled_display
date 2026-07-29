@@ -1,0 +1,1053 @@
+import sys, os, time, math, datetime, logging
+import pygame
+from dataclasses import dataclass
+from typing import Any, List, Dict, Tuple
+
+from luma.core.interface.serial import spi
+from luma.oled.device import ssd1309
+from PIL import Image
+
+# ---------- Optional dependencies ----------
+try:
+    import ephem
+    HAS_EPHEM = True
+except ModuleNotFoundError:
+    HAS_EPHEM = False
+
+try:
+    import board, busio, adafruit_bno055
+    HAS_BNO055 = True
+except ModuleNotFoundError:
+    HAS_BNO055 = False
+
+try:
+    from gpiozero import Button
+    HAS_GPIO = True
+except ImportError:
+    HAS_GPIO = False
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+# Native 128x64 render for perfect OLED output
+SCREEN_W, SCREEN_H     = 128, 64  
+FOV_H_DEG, FOV_V_DEG   = 35.0, 18.0
+PX_PER_DEG_X           = SCREEN_W / FOV_H_DEG
+PX_PER_DEG_Y           = SCREEN_H / FOV_V_DEG
+LAT, LON               = 42.36, -71.09
+ASTRO_REFRESH          = 5.0
+FPS                    = 30
+TOP_H, BOT_H           = 12, 12     # Increased HUD bar height for readability
+
+os.environ["SDL_VIDEO_CENTERED"] = "1"
+pygame.init()
+
+# ---------- Desktop Window (Premium Control Panel UI) ----------
+DESKTOP_W, DESKTOP_H = 960, 540
+window = pygame.display.set_mode((DESKTOP_W, DESKTOP_H))
+pygame.display.set_caption("Star Tracker HUD - Observatory Control")
+
+# Internal render surface (128x64) - The "OLED"
+screen = pygame.Surface((SCREEN_W, SCREEN_H))
+
+# Desktop Native Sky View Surface
+SKY_W, SKY_H = 512, 256
+sky_surf = pygame.Surface((SKY_W, SKY_H))
+
+# ---------- Font selection with fallback ----------
+def _pick_font(size, bold=False):
+    candidates = ["consolas", "dejavusansmono", "liberationmono", "couriernew", "courier", "monospace"]
+    for name in candidates:
+        try:
+            f = pygame.font.SysFont(name, size, bold=bold)
+            if f.render("Az0123", False, (255, 255, 255)).get_width() > 0:
+                return f
+        except Exception:
+            continue
+    return pygame.font.Font(None, size + 2)
+
+# OLED Fonts
+FONT_TINY = _pick_font(9, bold=True)
+FONT_HUD  = _pick_font(9, bold=True)
+FONT_BIG  = _pick_font(13, bold=True)
+
+# Desktop Fonts
+DESKTOP_FONT_TITLE = _pick_font(28, bold=True)
+DESKTOP_FONT_MED   = _pick_font(16, bold=True)
+DESKTOP_FONT_SM    = _pick_font(14, bold=False)
+DESKTOP_FONT_SKY   = _pick_font(12, bold=False)
+
+# ---------- OLED ----------
+try:
+    _spi = spi(port=0, device=0, gpio_DC=24, gpio_RST=25)
+    oled = ssd1309(_spi, width=128, height=64, rotate=0)
+    HAS_OLED = True
+except Exception as e:
+    HAS_OLED = False
+    logging.error(f"OLED init failed (running in desktop mode only): {e}")
+
+
+# ============================================================
+# DATA MODEL
+# ============================================================
+@dataclass
+class CelestialObj:
+    name: str
+    short: str
+    kind: str            # 'star' | 'planet' | 'dso'
+    mag: float
+    body: Any = None
+    az: float = 0.0
+    alt: float = 0.0
+    visible: bool = False
+    sub: str = ""        # 'Pln' / 'Gal' / 'Neb' / 'Clu'
+    constellation: str = ""
+    distance: str = ""
+    description: str = ""
+    phase: float = 0.0        # For Moon
+    is_waxing: bool = True    # For Moon
+
+CATALOG: List[CelestialObj] = []
+BY_NAME: Dict[str, CelestialObj] = {}
+
+def _add(o: CelestialObj):
+    CATALOG.append(o)
+    BY_NAME[o.name] = o
+
+if HAS_EPHEM:
+    # ----- Sun & Moon -----
+    _add(CelestialObj("Sun", "SUN", "planet", -26.7, body=ephem.Sun(), sub="Sol",
+         constellation="Ecliptic", distance="1 AU", 
+         description="The star at the center of our Solar System. Do not look directly at it."))
+    _add(CelestialObj("Moon", "MOON", "planet", -12.0, body=ephem.Moon(), sub="Lun",
+         constellation="Ecliptic", distance="384,400 km", 
+         description="Earth's only natural satellite. Affects tides and eclipses."))
+
+    # ----- Planets -----
+    planets = [
+        ("Mercury","MERC", ephem.Mercury, -0.4, "Pln", "Zodiac", "0.39-1.3 AU", "Smallest planet, closest to the Sun. Hard to spot."),
+        ("Venus",  "VEN",  ephem.Venus,   -4.0, "Pln", "Zodiac", "0.3-1.7 AU", "Brightest planet. Often called Morning/Evening Star."),
+        ("Mars",   "MARS", ephem.Mars,    -2.0, "Pln", "Zodiac", "0.4-2.7 AU", "The Red Planet. Notable for its distinct color."),
+        ("Jupiter","JUPI", ephem.Jupiter, -2.5, "Pln", "Zodiac", "4.2-6.2 AU", "Largest planet. Has visible moons and cloud bands."),
+        ("Saturn", "SATU", ephem.Saturn,  -0.5, "Pln", "Zodiac", "8.0-11.0 AU", "Famous for its spectacular ring system."),
+        ("Uranus", "URAN", ephem.Uranus,   5.7, "Pln", "Zodiac", "18-20 AU", "Ice giant, appears as a tiny pale blue disk."),
+        ("Neptune","NEPT", ephem.Neptune,  7.8, "Pln", "Zodiac", "29-31 AU", "Farthest planet. Very faint, requires optics."),
+    ]
+    for name, short, klass, mag, sub, cons, dist, desc in planets:
+        _add(CelestialObj(name, short, "planet", mag, body=klass(), sub=sub, 
+                          constellation=cons, distance=dist, description=desc))
+
+    # ----- Bright named stars -----
+    stars = [
+        ("Sirius",     "SIRI",-1.46, "CMa", "8.6 ly", "Brightest star in the night sky. A binary system."),
+        ("Canopus",    "CANO",-0.74, "Car", "310 ly", "Second brightest star. A white giant."),
+        ("Arcturus",   "ARCT",-0.05, "Boo", "36.7 ly", "Brightest star in the northern sky. An orange giant."),
+        ("Vega",       "VEGA", 0.03, "Lyr", "25 ly", "Fifth brightest star. Standard for zero magnitude."),
+        ("Capella",    "CAPE", 0.08, "Aur", "42.9 ly", "Sixth brightest star. A quadruple star system."),
+        ("Rigel",      "RIGE", 0.13, "Ori", "860 ly", "Blue supergiant, seventh brightest star."),
+        ("Procyon",    "PROC", 0.34, "CMi", "11.5 ly", "Eighth brightest star. Forms Winter Triangle."),
+        ("Betelgeuse", "BETE", 0.42, "Ori", "548 ly", "Red supergiant. Highly variable and nearing end of life."),
+        ("Altair",     "ALTA", 0.77, "Aql", "16.7 ly", "Twelfth brightest star. Rotates extremely fast."),
+        ("Aldebaran",  "ALDE", 0.85, "Tau", "65.3 ly", "Orange giant. The eye of the bull."),
+        ("Antares",    "ANT",  1.06, "Sco", "550 ly", "Red supergiant. Rival of Mars."),
+        ("Spica",      "SPIC", 1.04, "Vir", "250 ly", "Blue giant. Brightest star in Virgo."),
+        ("Pollux",     "POLL", 1.14, "Gem", "33.8 ly", "Orange giant. Closest giant to the Sun."),
+        ("Fomalhaut",  "FORM", 1.16, "PsA", "25.1 ly", "White star. The 'Lonely Star' of autumn."),
+        ("Deneb",      "DENE", 1.25, "Cyg", "2615 ly", "Blue supergiant. Part of the Summer Triangle."),
+        ("Regulus",    "REGU", 1.35, "Leo", "79.3 ly", "Blue star. Ruler of the heavens."),
+        ("Castor",     "CAST", 1.58, "Gem", "51 ly", "Sextuple star system."),
+        ("Polaris",    "POLA", 1.97, "UMi", "433 ly", "Yellow supergiant. The North Star."),
+        ("Bellatrix",  "BELL", 1.64, "Ori", "250 ly", "Blue giant. The Amazon Star."),
+        ("Mintaka",    "MINT", 2.23, "Ori", "1200 ly", "Multiple star system. Westernmost belt star."),
+        ("Alnilam",    "ALNI", 1.69, "Ori", "2000 ly", "Blue supergiant. Center belt star."),
+        ("Alnitak",    "ALNZ", 1.74, "Ori", "1260 ly", "Triple star system. Eastern belt star."),
+        ("Saiph",      "SAIP", 2.09, "Ori", "650 ly", "Blue supergiant. Orion's right foot."),
+        ("Dubhe",      "DUBH", 1.79, "UMa", "123 ly", "Orange giant. Pointer star for Polaris."),
+        ("Merak",      "MERA", 2.37, "UMa", "80 ly", "White star. Pointer star for Polaris."),
+        ("Phecda",     "PHEC", 2.44, "UMa", "84 ly", "White star. Part of the Big Dipper bowl."),
+        ("Megrez",     "MEGR", 3.31, "UMa", "58 ly", "White star. Connects Dipper handle to bowl."),
+        ("Alioth",     "ALIO", 1.76, "UMa", "81 ly", "White star. Brightest in Ursa Major."),
+        ("Mizar",      "MIZA", 2.27, "UMa", "83 ly", "Famous double star. Middle of handle."),
+        ("Alkaid",     "ALKA", 1.85, "UMa", "104 ly", "Blue star. End of Dipper handle."),
+        ("Caph",       "CAPH", 2.27, "Cas", "54 ly", "Yellow-white star. Part of Cassiopeia W."),
+        ("Schedar",    "SCHE", 2.24, "Cas", "228 ly", "Orange giant. Brightest in Cassiopeia."),
+        ("Ruchbah",    "RUCH", 2.68, "Cas", "99 ly", "A-line star. Eclipsing binary."),
+        ("Segin",      "SEGI", 3.38, "Cas", "441 ly", "Blue giant. End of Cassiopeia W."),
+        ("Algol",      "ALGO", 2.12, "Per", "90 ly", "Famous eclipsing binary. The Demon Star."),
+        ("Hamal",      "HAMA", 2.00, "Ari", "66 ly", "Orange giant. Brightest in Aries."),
+        ("Mirfak",     "MIRF", 1.79, "Per", "510 ly", "Yellow-white supergiant. Alpha Persei."),
+        ("Denebola",   "DENB", 2.14, "Leo", "58 ly", "Blue star. Lion's tail."),
+    ]
+    for name, short, mag, cons, dist, desc in stars:
+        try:
+            _add(CelestialObj(name, short, "star", mag, body=ephem.star(name), 
+                              constellation=cons, distance=dist, description=desc))
+        except Exception as e:
+            logging.warning(f"Skip star {name}: {e}")
+
+    # ----- Deep-sky objects (Messier) -----
+    dsos = [
+        ("M31 Andromeda","M31","0:42:44.3",  "+41:16:09", 3.4, "Gal", "And", "2.5M ly", "Closest large spiral galaxy to the Milky Way."),
+        ("M42 Orion Neb","M42","5:35:17.3",  "-5:23:28",  4.0, "Neb", "Ori", "1344 ly", "Diffuse nebula in Orion's sword. Stellar nursery."),
+        ("M45 Pleiades", "M45","3:47:24.0",  "+24:07:00", 1.6, "Clu", "Tau", "444 ly", "Open star cluster. The Seven Sisters."),
+        ("M44 Beehive",  "M44","8:40:24.0",  "+19:59:00", 3.7, "Clu", "Cnc", "577 ly", "Open star cluster. Also known as Praesepe."),
+        ("M13 Hercules", "M13","16:41:41.6", "+36:27:35", 5.8, "Clu", "Her", "22.2k ly", "Globular cluster. Brightest in northern sky."),
+        ("M57 Ring Neb", "M57","18:53:35.1", "+33:01:45", 8.8, "Neb", "Lyr", "2.3k ly", "Planetary nebula. Resembles a smoke ring."),
+        ("M81 Bode",     "M81","9:55:33.2",  "+69:03:55", 6.9, "Gal", "UMa", "12M ly", "Grand design spiral galaxy."),
+        ("M51 Whirlpool","M51","13:29:52.7", "+47:11:43", 8.4, "Gal", "CVn", "23M ly", "Interacting spiral galaxy with companion."),
+    ]
+    for name, short, ra, dec, mag, sub, cons, dist, desc in dsos:
+        fb = ephem.FixedBody()
+        fb._ra  = ephem.hours(ra)
+        fb._dec = ephem.degrees(dec)
+        _add(CelestialObj(name, short, "dso", mag, body=fb, sub=sub, 
+                          constellation=cons, distance=dist, description=desc))
+
+
+# ============================================================
+# CONSTELLATION LINES (by star name)
+# ============================================================
+CONSTELLATION_LINES: List[Tuple[str, str]] = [
+    ("Betelgeuse","Bellatrix"), ("Bellatrix","Mintaka"),
+    ("Mintaka","Alnilam"),      ("Alnilam","Alnitak"),
+    ("Alnitak","Saiph"),        ("Saiph","Rigel"),
+    ("Rigel","Mintaka"),        ("Betelgeuse","Alnitak"),
+    ("Dubhe","Merak"),   ("Merak","Phecda"), ("Phecda","Megrez"),
+    ("Megrez","Dubhe"),  ("Megrez","Alioth"),("Alioth","Mizar"),
+    ("Mizar","Alkaid"),
+    ("Caph","Schedar"), ("Schedar","Ruchbah"), ("Ruchbah","Segin"),
+    ("Regulus","Denebola"),
+]
+
+
+# ============================================================
+# STATE
+# ============================================================
+state = {
+    "target_index": 0,
+    "yaw_offset":   0.0,
+    "pitch_offset": 0.0,
+    "calib_timer":  0,
+    "msg_text":     "",
+    "msg_timer":    0,
+    "show_const":   True,
+    "show_dso":     True,
+    "show_label":   True,
+    "show_info":    False,
+    "filter_mag":   5.0,
+    "last_astro":   0.0,
+    "blink":        0,
+    "mode":         "TRK",
+    "raw_yaw":      0.0,
+    "current_yaw":  10.0,
+    "current_pitch":20.0,
+    "current_roll": 0.0,
+}
+
+def next_target():
+    if CATALOG:
+        state["target_index"] = (state["target_index"] + 1) % len(CATALOG)
+        state["show_info"] = False
+
+def do_calibrate():
+    state["yaw_offset"]   = -state["raw_yaw"]
+    state["pitch_offset"] = -state["current_pitch"]
+    state["calib_timer"]  = 40
+
+def show_message(text):
+    state["msg_text"] = text
+    state["msg_timer"] = 30
+
+
+# ============================================================
+# HARDWARE
+# ============================================================
+bno = None
+if HAS_BNO055:
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA)
+        bno = adafruit_bno055.BNO055_I2C(i2c)
+    except Exception as e:
+        logging.error(f"BNO init: {e}")
+
+if HAS_GPIO:
+    try:
+        btn_next  = Button(17, pull_up=True, bounce_time=0.1)
+        btn_calib = Button(27, pull_up=True, bounce_time=0.1)
+        btn_info  = Button(22, pull_up=True, bounce_time=0.1)
+        btn_next.when_pressed  = next_target
+        btn_calib.when_pressed = do_calibrate
+        btn_info.when_pressed  = lambda: state.update({"show_info": not state["show_info"]})
+    except Exception as e:
+        logging.error(f"GPIO init: {e}")
+
+
+# ============================================================
+# ASTRONOMICAL UPDATE
+# ============================================================
+def update_positions():
+    if not HAS_EPHEM: return
+    obs = ephem.Observer()
+    obs.lat, obs.lon = str(LAT), str(LON)
+    obs.date = datetime.datetime.now(datetime.timezone.utc)
+    obs.horizon = "-1:00"
+    sun = ephem.Sun()
+    sun.compute(obs)
+    sun_lon = ephem.Ecliptic(sun).lon
+
+    for o in CATALOG:
+        try:
+            o.body.compute(obs)
+            o.az  = math.degrees(o.body.az)
+            o.alt = math.degrees(o.body.alt)
+            o.visible = o.alt > -1
+            
+            if o.name == "Moon":
+                o.phase = o.body.phase
+                moon_lon = ephem.Ecliptic(o.body).lon
+                o.is_waxing = moon_lon > sun_lon
+        except Exception:
+            o.visible = False
+
+
+# ============================================================
+# PROJECTION
+# ============================================================
+def project(az, alt):
+    d_az  = ((az - state["current_yaw"] + 180) % 360) - 180
+    d_alt = alt - state["current_pitch"]
+    x = SCREEN_W * 0.5 + d_az  * PX_PER_DEG_X
+    y = SCREEN_H * 0.5 - d_alt * PX_PER_DEG_Y
+    return x, y
+
+def project_native(az, alt, w, h):
+    d_az  = ((az - state["current_yaw"] + 180) % 360) - 180
+    d_alt = alt - state["current_pitch"]
+    x = w * 0.5 + d_az * (PX_PER_DEG_X * (w / SCREEN_W))
+    y = h * 0.5 - d_alt * (PX_PER_DEG_Y * (h / SCREEN_H))
+    return x, y
+
+def in_view(x, y, w, h, m=4):
+    return -m <= x <= w + m and -m <= y <= h + m
+
+
+# ============================================================
+# 1-BIT DRAW HELPERS (OLED)
+# ============================================================
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+
+def _px(surf, x, y):
+    if 0 <= x < SCREEN_W and 0 <= y < SCREEN_H:
+        surf.set_at((x, y), WHITE)
+
+def dashed_line(surf, p1, p2, dash=2, gap=1):
+    x1, y1 = p1; x2, y2 = p2
+    dx, dy = x2 - x1, y2 - y1
+    dist = math.hypot(dx, dy)
+    if dist < 1: return
+    ux, uy = dx / dist, dy / dist
+    d = 0
+    while d < dist:
+        d_end = min(d + dash, dist)
+        sx, sy = x1 + ux * d, y1 + uy * d
+        ex, ey = x1 + ux * d_end, y1 + uy * d_end
+        pygame.draw.line(surf, WHITE, (sx, sy), (ex, ey))
+        d += dash + gap
+
+def draw_dashed_circle(surf, cx, cy, r, segs=8):
+    for i in range(segs):
+        if i % 2 == 0: continue
+        a1 = (i / segs) * 2 * math.pi
+        a2 = ((i + 1) / segs) * 2 * math.pi
+        x1 = cx + math.cos(a1) * r; y1 = cy + math.sin(a1) * r
+        x2 = cx + math.cos(a2) * r; y2 = cy + math.sin(a2) * r
+        pygame.draw.line(surf, WHITE, (x1, y1), (x2, y2))
+
+def draw_star(surf, x, y, mag):
+    if mag < 0:
+        for d in range(-2, 3):
+            _px(surf, x + d, y); _px(surf, x, y + d)
+    elif mag < 1.5:
+        _px(surf, x, y); _px(surf, x+1, y)
+        _px(surf, x, y+1); _px(surf, x+1, y+1)
+    else:
+        _px(surf, x, y)
+
+def draw_moon(surf, x, y, phase, waxing):
+    r = 4
+    b = r * (1.0 - phase / 50.0)
+    for dx in range(-r, r + 1):
+        for dy in range(-r, r + 1):
+            dist_sq = dx*dx + dy*dy
+            if dist_sq <= r*r:
+                is_lit = False
+                if phase == 0:
+                    is_lit = False
+                elif phase == 100:
+                    is_lit = True
+                else:
+                    x_term = b * math.sqrt(max(0, 1 - (dy*dy)/(r*r)))
+                    if waxing:
+                        if phase < 50:
+                            if dx > -x_term: is_lit = True
+                        else:
+                            if dx > x_term: is_lit = True
+                    else:
+                        if phase < 50:
+                            if dx < x_term: is_lit = True
+                        else:
+                            if dx < -x_term: is_lit = True
+                if is_lit:
+                    _px(surf, x + dx, y + dy)
+
+def draw_corner_brackets():
+    bl = 6
+    yt, yb = TOP_H, SCREEN_H - BOT_H - 1
+    pygame.draw.line(screen, WHITE, (0, yt), (bl, yt))
+    pygame.draw.line(screen, WHITE, (0, yt), (0, yt + bl))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yt), (SCREEN_W - 1 - bl, yt))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yt), (SCREEN_W - 1, yt + bl))
+    pygame.draw.line(screen, WHITE, (0, yb), (bl, yb))
+    pygame.draw.line(screen, WHITE, (0, yb), (0, yb - bl))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yb), (SCREEN_W - 1 - bl, yb))
+    pygame.draw.line(screen, WHITE, (SCREEN_W - 1, yb), (SCREEN_W - 1, yb - bl))
+
+def draw_offscreen_arrow(tx, ty):
+    cx, cy = SCREEN_W // 2, SCREEN_H // 2
+    dx, dy = tx - cx, ty - cy
+    ang = math.atan2(dy, dx)
+    rx = SCREEN_W / 2 - 12
+    ry = SCREEN_H / 2 - 14
+    sx = abs(math.cos(ang)) or 1e-6
+    sy = abs(math.sin(ang)) or 1e-6
+    scale = min(rx / sx, ry / sy)
+    ix = int(cx + math.cos(ang) * scale)
+    iy = int(cy + math.sin(ang) * scale)
+    head = 4
+    a1 = ang + math.pi - 0.5
+    a2 = ang + math.pi + 0.5
+    pygame.draw.line(screen, WHITE, (ix, iy),
+                     (int(ix + math.cos(a1) * head), int(iy + math.sin(a1) * head)))
+    pygame.draw.line(screen, WHITE, (ix, iy),
+                     (int(ix + math.cos(a2) * head), int(iy + math.sin(a2) * head)))
+
+def blit_text_with_bg(surf, text, font, x, y, pad_x=1, pad_y=0, align="left"):
+    label = font.render(text, False, WHITE)
+    lw, lh = label.get_width(), label.get_height()
+    if align == "right":
+        rx = x - lw
+    elif align == "center":
+        rx = x - lw // 2
+    else:
+        rx = x
+    ry = y
+    plate = pygame.Rect(rx - pad_x, ry - pad_y, lw + 2 * pad_x, lh + 2 * pad_y)
+    if plate.left < 0: plate.left = 0
+    if plate.right > SCREEN_W: plate.right = SCREEN_W
+    if plate.top < 0: plate.top = 0
+    if plate.bottom > SCREEN_H: plate.bottom = SCREEN_H
+    pygame.draw.rect(surf, BLACK, plate)
+    surf.blit(label, (rx, ry))
+    return plate
+
+def wrap_text(text, font, max_width):
+    words = text.split()
+    lines = []
+    current_line = ""
+    for word in words:
+        test_line = current_line + (" " if current_line else "") + word
+        if font.size(test_line)[0] <= max_width:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+            current_line = word
+    if current_line:
+        lines.append(current_line)
+    return lines
+
+
+# ============================================================
+# RENDER OLED
+# ============================================================
+def render_oled():
+    screen.fill(BLACK)
+    cx, cy = SCREEN_W // 2, SCREEN_H // 2
+    view_top = TOP_H
+    view_bot = SCREEN_H - BOT_H
+    tgt = CATALOG[state["target_index"]] if CATALOG else None
+
+    if state["show_info"] and tgt:
+        screen.fill(BLACK)
+        title = FONT_BIG.render(tgt.name, False, WHITE)
+        screen.blit(title, (2, 2))
+        pygame.draw.line(screen, WHITE, (0, 16), (SCREEN_W, 16))
+        y = 20
+        screen.blit(FONT_HUD.render(f"Type: {tgt.kind.upper()} ({tgt.sub})", False, WHITE), (2, y)); y += 10
+        screen.blit(FONT_HUD.render(f"Cons: {tgt.constellation}", False, WHITE), (2, y)); y += 10
+        screen.blit(FONT_HUD.render(f"Mag:  {tgt.mag:+.1f}", False, WHITE), (2, y)); y += 10
+        screen.blit(FONT_HUD.render(f"Dist: {tgt.distance}", False, WHITE), (2, y)); y += 10
+        if tgt.name == "Moon":
+            screen.blit(FONT_HUD.render(f"Phse:{tgt.phase:.1f}%", False, WHITE), (2, y)); y += 10
+        else:
+            screen.blit(FONT_HUD.render(f"Alt:  {tgt.alt:+04.1f}", False, WHITE), (2, y)); y += 10
+        pygame.draw.line(screen, WHITE, (0, y), (SCREEN_W, y)); y += 2
+        desc_lines = wrap_text(tgt.description, FONT_TINY, SCREEN_W - 4)
+        for line in desc_lines:
+            screen.blit(FONT_TINY.render(line, False, WHITE), (2, y))
+            y += 10
+        return
+
+    # 1. Compass ticks
+    for deg, lbl in [(0, "N"), (90, "E"), (180, "S"), (270, "W")]:
+        dx = ((deg - state["current_yaw"] + 180) % 360) - 180
+        if abs(dx) < FOV_H_DEG * 0.6:
+            x = int(cx + dx * PX_PER_DEG_X)
+            pygame.draw.line(screen, WHITE, (x, view_top + 1), (x, view_top + 4))
+            blit_text_with_bg(screen, lbl, FONT_TINY, x, view_top + 5, pad_x=1, pad_y=0, align="center")
+
+    # 2. Corner brackets
+    draw_corner_brackets()
+
+    # 3. Constellation lines
+    if state["show_const"]:
+        for a, b in CONSTELLATION_LINES:
+            oa = BY_NAME.get(a); ob = BY_NAME.get(b)
+            if not oa or not ob: continue
+            if oa.alt < -2 or ob.alt < -2: continue
+            x1, y1 = project(oa.az, oa.alt)
+            x2, y2 = project(ob.az, ob.alt)
+            if not (in_view(x1, y1, SCREEN_W, SCREEN_H, 60) or in_view(x2, y2, SCREEN_W, SCREEN_H, 60)):
+                continue
+            dashed_line(screen, (x1, y1), (x2, y2), dash=2, gap=1)
+
+    # 4. Celestial objects
+    for idx, o in enumerate(CATALOG):
+        if o.kind == "dso" and not state["show_dso"]: continue
+        if o.alt < -1: continue
+        if o.mag > state["filter_mag"] and o.name not in ["Sun", "Moon"]: continue
+        x, y = project(o.az, o.alt)
+        if not in_view(x, y, SCREEN_W, SCREEN_H): continue
+        ix, iy = int(x), int(y)
+        is_target = (idx == state["target_index"])
+
+        if o.name == "Sun":
+            pygame.draw.circle(screen, WHITE, (ix, iy), 4)
+            pygame.draw.line(screen, WHITE, (ix-6, iy), (ix-4, iy))
+            pygame.draw.line(screen, WHITE, (ix+4, iy), (ix+6, iy))
+            pygame.draw.line(screen, WHITE, (ix, iy-6), (ix, iy-4))
+            pygame.draw.line(screen, WHITE, (ix, iy+4), (ix, iy+6))
+        elif o.name == "Moon":
+            draw_moon(screen, ix, iy, o.phase, o.is_waxing)
+        elif o.kind == "dso":
+            draw_dashed_circle(screen, ix, iy, 3)
+        elif o.kind == "planet":
+            draw_star(screen, ix, iy, 0.0)
+            draw_dashed_circle(screen, ix, iy, 3)
+        else:
+            draw_star(screen, ix, iy, o.mag)
+
+        if is_target and (state["blink"] // 8) % 2 == 0:
+            pygame.draw.rect(screen, WHITE, (ix - 5, iy - 5, 11, 11), 1)
+            pygame.draw.line(screen, WHITE, (ix - 7, iy - 7), (ix - 5, iy - 5))
+            pygame.draw.line(screen, WHITE, (ix + 5, iy - 7), (ix + 7, iy - 5))
+            pygame.draw.line(screen, WHITE, (ix - 7, iy + 7), (ix - 5, iy + 5))
+            pygame.draw.line(screen, WHITE, (ix + 5, iy + 7), (ix + 7, iy + 5))
+
+        if state["show_label"] and (o.kind != "star" or o.mag < 1.5 or is_target):
+            lbl = FONT_TINY.render(o.short, False, WHITE)
+            lw, lh = lbl.get_width(), lbl.get_height()
+            lx = ix + 4
+            ly = iy - lh // 2
+            if lx + lw > SCREEN_W - 1: lx = ix - lw - 4
+            if ly < view_top + 1: ly = view_top + 1
+            if ly + lh > view_bot - 1: ly = view_bot - 1 - lh
+            plate = pygame.Rect(lx - 1, ly, lw + 2, lh)
+            pygame.draw.rect(screen, BLACK, plate)
+            screen.blit(lbl, (lx, ly))
+
+    # 5. Off-screen target arrow
+    if tgt and tgt.alt >= -1:
+        tx, ty = project(tgt.az, tgt.alt)
+        if not (0 <= tx < SCREEN_W and view_top <= ty < view_bot):
+            draw_offscreen_arrow(tx, ty)
+
+    # 6. Center crosshair
+    pygame.draw.line(screen, WHITE, (cx - 5, cy), (cx - 2, cy))
+    pygame.draw.line(screen, WHITE, (cx + 2, cy), (cx + 5, cy))
+    pygame.draw.line(screen, WHITE, (cx, cy - 5), (cx, cy - 2))
+    pygame.draw.line(screen, WHITE, (cx, cy + 2), (cx, cy + 5))
+
+    # 7. Top HUD bar
+    pygame.draw.rect(screen, BLACK, (0, 0, SCREEN_W, TOP_H))
+    pygame.draw.line(screen, WHITE, (0, TOP_H), (SCREEN_W, TOP_H))
+    hud_l = FONT_HUD.render(f"Y{int(state['current_yaw'])%360:03d} P{int(state['current_pitch']):+03d} R{int(state['current_roll']):+02d}", False, WHITE)
+    screen.blit(hud_l, (1, 2))
+    if tgt:
+        hud_r = FONT_HUD.render(tgt.short, False, WHITE)
+        screen.blit(hud_r, (SCREEN_W - hud_r.get_width() - 1, 2))
+
+    # 8. Bottom HUD bar
+    pygame.draw.line(screen, WHITE, (0, view_bot), (SCREEN_W, view_bot))
+    pygame.draw.rect(screen, BLACK, (0, view_bot + 1, SCREEN_W, BOT_H - 1))
+    if tgt:
+        v_flag = "OK" if tgt.visible else "--"
+        info = f"{tgt.short} {tgt.alt:+04.0f}/{tgt.az:03.0f} {v_flag}"
+        screen.blit(FONT_HUD.render(info, False, WHITE), (1, view_bot + 2))
+    mode_lbl = FONT_HUD.render(state["mode"], False, WHITE)
+    screen.blit(mode_lbl, (SCREEN_W - mode_lbl.get_width() - 1, view_bot + 2))
+    mag_lbl = FONT_HUD.render(f"m{state['filter_mag']:.1f}", False, WHITE)
+    screen.blit(mag_lbl, (SCREEN_W // 2 - mag_lbl.get_width() // 2, view_bot + 2))
+
+    # 9. Calibration banner
+    if state["calib_timer"] > 0:
+        msg = FONT_BIG.render("CALIBRATED", False, WHITE)
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        plate = pygame.Rect(bx - 4, by - 2, msg.get_width() + 8, msg.get_height() + 4)
+        pygame.draw.rect(screen, BLACK, plate)
+        pygame.draw.rect(screen, WHITE, plate, 1)
+        screen.blit(msg, (bx, by))
+        state["calib_timer"] -= 1
+
+    # 10. On-screen messages
+    if state["msg_timer"] > 0:
+        msg = FONT_BIG.render(state["msg_text"], False, WHITE)
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        plate = pygame.Rect(bx - 4, by - 2, msg.get_width() + 8, msg.get_height() + 4)
+        pygame.draw.rect(screen, BLACK, plate)
+        pygame.draw.rect(screen, WHITE, plate, 1)
+        screen.blit(msg, (bx, by))
+        state["msg_timer"] -= 1
+
+    state["blink"] = (state["blink"] + 1) % 60
+
+
+# ============================================================
+# DESKTOP NATIVE SKY RENDER
+# ============================================================
+def render_desktop_sky(tgt):
+    sky_surf.fill((10, 12, 20))
+    cx, cy = SKY_W // 2, SKY_H // 2
+    view_top = 35
+    view_bot = SKY_H - 35
+
+    # --- INFO PAGE OVERLAY (Desktop Native) ---
+    if state["show_info"] and tgt:
+        sky_surf.fill((5, 5, 12))
+        title = DESKTOP_FONT_TITLE.render(tgt.name, True, (0, 255, 200))
+        sky_surf.blit(title, (20, 20))
+        pygame.draw.line(sky_surf, (100, 100, 120), (20, 55), (SKY_W - 20, 55), 2)
+        
+        y = 65
+        info_lines = [
+            f"Type: {tgt.kind.upper()} ({tgt.sub})",
+            f"Constellation: {tgt.constellation}",
+            f"Magnitude: {tgt.mag:+.2f}",
+            f"Distance: {tgt.distance}"
+        ]
+        for line in info_lines:
+            sky_surf.blit(DESKTOP_FONT_MED.render(line, True, (220, 220, 220)), (20, y))
+            y += 25
+        
+        if tgt.name == "Moon":
+            sky_surf.blit(DESKTOP_FONT_MED.render(f"Phase: {tgt.phase:.1f}% ({'Waxing' if tgt.is_waxing else 'Waning'})", True, (255, 80, 80)), (20, y))
+            y += 25
+            
+        pygame.draw.line(sky_surf, (100, 100, 120), (20, y), (SKY_W - 20, y), 1)
+        y += 15
+        
+        desc_lines = wrap_text(tgt.description, DESKTOP_FONT_SKY, SKY_W - 40)
+        for line in desc_lines:
+            sky_surf.blit(DESKTOP_FONT_SKY.render(line, True, (180, 180, 180)), (20, y))
+            y += 18
+        return
+
+    # --- LIVE SKYVIEW ---
+    # 1. Compass ticks
+    for deg, lbl in [(0, "N"), (90, "E"), (180, "S"), (270, "W")]:
+        dx = ((deg - state["current_yaw"] + 180) % 360) - 180
+        if abs(dx) < FOV_H_DEG * 0.6:
+            x = int(cx + dx * (PX_PER_DEG_X * 4))
+            pygame.draw.line(sky_surf, (100, 100, 120), (x, view_top + 1), (x, view_top + 6), 2)
+            lbl_s = DESKTOP_FONT_SKY.render(lbl, True, (150, 150, 170))
+            sky_surf.blit(lbl_s, (x - lbl_s.get_width() // 2, view_top + 10))
+
+    # 2. Corner brackets
+    bl = 20
+    pygame.draw.line(sky_surf, (100, 100, 120), (5, view_top), (5 + bl, view_top), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (5, view_top), (5, view_top + bl), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (SKY_W - 5, view_top), (SKY_W - 5 - bl, view_top), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (SKY_W - 5, view_top), (SKY_W - 5, view_top + bl), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (5, view_bot), (5 + bl, view_bot), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (5, view_bot), (5, view_bot - bl), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (SKY_W - 5, view_bot), (SKY_W - 5 - bl, view_bot), 2)
+    pygame.draw.line(sky_surf, (100, 100, 120), (SKY_W - 5, view_bot), (SKY_W - 5, view_bot - bl), 2)
+
+    # 3. Constellation lines
+    if state["show_const"]:
+        for a, b in CONSTELLATION_LINES:
+            oa = BY_NAME.get(a); ob = BY_NAME.get(b)
+            if not oa or not ob: continue
+            if oa.alt < -2 or ob.alt < -2: continue
+            x1, y1 = project_native(oa.az, oa.alt, SKY_W, SKY_H)
+            x2, y2 = project_native(ob.az, ob.alt, SKY_W, SKY_H)
+            if not (in_view(x1, y1, SKY_W, SKY_H, 100) or in_view(x2, y2, SKY_W, SKY_H, 100)):
+                continue
+            pygame.draw.aaline(sky_surf, (40, 50, 80), (x1, y1), (x2, y2))
+
+    # 4. Celestial objects
+    for idx, o in enumerate(CATALOG):
+        if o.kind == "dso" and not state["show_dso"]: continue
+        if o.alt < -1: continue
+        if o.mag > state["filter_mag"] and o.name not in ["Sun", "Moon"]: continue
+        x, y = project_native(o.az, o.alt, SKY_W, SKY_H)
+        if not in_view(x, y, SKY_W, SKY_H): continue
+        ix, iy = int(x), int(y)
+        is_target = (idx == state["target_index"])
+
+        if o.name == "Sun":
+            pygame.draw.circle(sky_surf, (255, 200, 0), (ix, iy), 12)
+            pygame.draw.line(sky_surf, (255, 200, 0), (ix-18, iy), (ix-14, iy), 2)
+            pygame.draw.line(sky_surf, (255, 200, 0), (ix+14, iy), (ix+18, iy), 2)
+            pygame.draw.line(sky_surf, (255, 200, 0), (ix, iy-18), (ix, iy-14), 2)
+            pygame.draw.line(sky_surf, (255, 200, 0), (ix, iy+14), (ix, iy+18), 2)
+        elif o.name == "Moon":
+            r = 14
+            b = r * (1.0 - o.phase / 50.0)
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    dist_sq = dx*dx + dy*dy
+                    if dist_sq <= r*r:
+                        is_lit = False
+                        if o.phase == 0: is_lit = False
+                        elif o.phase == 100: is_lit = True
+                        else:
+                            x_term = b * math.sqrt(max(0, 1 - (dy*dy)/(r*r)))
+                            if o.is_waxing:
+                                if o.phase < 50:
+                                    if dx > -x_term: is_lit = True
+                                else:
+                                    if dx > x_term: is_lit = True
+                            else:
+                                if o.phase < 50:
+                                    if dx < x_term: is_lit = True
+                                else:
+                                    if dx < -x_term: is_lit = True
+                        color = (240, 240, 230) if is_lit else (40, 40, 50)
+                        sky_surf.set_at((ix + dx, iy + dy), color)
+        elif o.kind == "dso":
+            pygame.draw.circle(sky_surf, (100, 150, 255), (ix, iy), 8, 1)
+        elif o.kind == "planet":
+            pygame.draw.circle(sky_surf, (255, 165, 0), (ix, iy), 5)
+            pygame.draw.circle(sky_surf, (100, 150, 255), (ix, iy), 10, 1)
+        else:
+            r = max(1, int(3 - o.mag / 1.5))
+            color = (255, 255, 255) if o.mag > 0 else (255, 255, 150)
+            pygame.draw.circle(sky_surf, color, (ix, iy), r)
+            if o.mag < 1.0:
+                pygame.draw.circle(sky_surf, (255, 255, 150, 50), (ix, iy), r+3, 1)
+
+        # Target reticle
+        if is_target and (state["blink"] // 8) % 2 == 0:
+            pygame.draw.rect(sky_surf, (255, 60, 60), (ix - 12, iy - 12, 24, 24), 2)
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix - 18, iy - 18), (ix - 12, iy - 12), 2)
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix + 12, iy - 18), (ix + 18, iy - 12), 2)
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix - 18, iy + 18), (ix - 12, iy + 12), 2)
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix + 12, iy + 18), (ix + 18, iy + 12), 2)
+
+        # Labels
+        if state["show_label"] and (o.kind != "star" or o.mag < 1.5 or is_target):
+            lbl = DESKTOP_FONT_SKY.render(o.short, True, (200, 200, 200))
+            lw, lh = lbl.get_width(), lbl.get_height()
+            lx = ix + 10
+            ly = iy - lh // 2
+            if lx + lw > SKY_W - 5: lx = ix - lw - 10
+            if ly < view_top + 1: ly = view_top + 1
+            if ly + lh > view_bot - 1: ly = view_bot - 1 - lh
+            plate = pygame.Rect(lx - 3, ly - 1, lw + 6, lh + 2)
+            pygame.draw.rect(sky_surf, (0, 0, 0), plate)
+            sky_surf.blit(lbl, (lx, ly))
+
+    # 5. Off-screen target arrow
+    if tgt and tgt.alt >= -1:
+        tx, ty = project_native(tgt.az, tgt.alt, SKY_W, SKY_H)
+        if not (0 <= tx < SKY_W and view_top <= ty < view_bot):
+            dx, dy = tx - cx, ty - cy
+            ang = math.atan2(dy, dx)
+            rx, ry = SKY_W / 2 - 30, SKY_H / 2 - 40
+            sx = abs(math.cos(ang)) or 1e-6
+            sy = abs(math.sin(ang)) or 1e-6
+            scale = min(rx / sx, ry / sy)
+            ix = int(cx + math.cos(ang) * scale)
+            iy = int(cy + math.sin(ang) * scale)
+            head = 12
+            a1 = ang + math.pi - 0.5
+            a2 = ang + math.pi + 0.5
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix, iy),
+                             (int(ix + math.cos(a1) * head), int(iy + math.sin(a1) * head)), 3)
+            pygame.draw.line(sky_surf, (255, 60, 60), (ix, iy),
+                             (int(ix + math.cos(a2) * head), int(iy + math.sin(a2) * head)), 3)
+
+    # 6. Center crosshair
+    pygame.draw.line(sky_surf, (0, 255, 100), (cx - 20, cy), (cx - 8, cy), 2)
+    pygame.draw.line(sky_surf, (0, 255, 100), (cx + 8, cy), (cx + 20, cy), 2)
+    pygame.draw.line(sky_surf, (0, 255, 100), (cx, cy - 20), (cx, cy - 8), 2)
+    pygame.draw.line(sky_surf, (0, 255, 100), (cx, cy + 8), (cx, cy + 20), 2)
+    pygame.draw.circle(sky_surf, (0, 255, 100), (cx, cy), 3, 1)
+
+    # 7. Top HUD bar
+    pygame.draw.rect(sky_surf, (20, 25, 35), (0, 0, SKY_W, view_top))
+    pygame.draw.line(sky_surf, (60, 70, 90), (0, view_top), (SKY_W, view_top), 2)
+    hud_l_text = f"YAW {int(state['current_yaw'])%360:03d}°  PITCH {int(state['current_pitch']):+03d}°  ROLL {int(state['current_roll']):+02d}°"
+    hud_l = DESKTOP_FONT_MED.render(hud_l_text, True, (0, 255, 200))
+    sky_surf.blit(hud_l, (10, 10))
+    if tgt:
+        hud_r = DESKTOP_FONT_MED.render(f"TGT: {tgt.short}", True, (0, 255, 200))
+        sky_surf.blit(hud_r, (SKY_W - hud_r.get_width() - 10, 10))
+
+    # 8. Bottom HUD bar
+    pygame.draw.line(sky_surf, (60, 70, 90), (0, view_bot), (SKY_W, view_bot), 2)
+    pygame.draw.rect(sky_surf, (20, 25, 35), (0, view_bot + 1, SKY_W, SKY_H - view_bot - 1))
+    if tgt:
+        v_flag = "VISIBLE" if tgt.visible else "HIDDEN"
+        v_color = (0, 255, 100) if tgt.visible else (255, 80, 80)
+        info_text = f"{tgt.name}  |  Alt: {tgt.alt:+04.1f}°  Az: {tgt.az:03.0f}°  |  Status: {v_flag}"
+        info_lbl = DESKTOP_FONT_MED.render(info_text, True, v_color)
+        sky_surf.blit(info_lbl, (10, view_bot + 12))
+    mode_lbl = DESKTOP_FONT_MED.render(f"[{state['mode']}]", True, (0, 255, 200))
+    sky_surf.blit(mode_lbl, (SKY_W - mode_lbl.get_width() - 10, view_bot + 12))
+    mag_lbl = DESKTOP_FONT_MED.render(f"Mag Filter: {state['filter_mag']:.1f}", True, (255, 255, 255))
+    sky_surf.blit(mag_lbl, (SKY_W // 2 - mag_lbl.get_width() // 2, view_bot + 12))
+
+    # 9. Calibration banner
+    if state["calib_timer"] > 0:
+        msg = DESKTOP_FONT_TITLE.render("CALIBRATED", True, (0, 255, 100))
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        plate = pygame.Rect(bx - 15, by - 10, msg.get_width() + 30, msg.get_height() + 20)
+        pygame.draw.rect(sky_surf, (0, 20, 0), plate)
+        pygame.draw.rect(sky_surf, (0, 255, 100), plate, 2)
+        sky_surf.blit(msg, (bx, by))
+        state["calib_timer"] -= 1
+
+    # 10. On-screen messages
+    if state["msg_timer"] > 0:
+        msg = DESKTOP_FONT_TITLE.render(state["msg_text"], True, (255, 255, 255))
+        bx = cx - msg.get_width() // 2
+        by = cy - msg.get_height() // 2
+        plate = pygame.Rect(bx - 15, by - 10, msg.get_width() + 30, msg.get_height() + 20)
+        pygame.draw.rect(sky_surf, (20, 20, 30), plate)
+        pygame.draw.rect(sky_surf, (200, 200, 200), plate, 2)
+        sky_surf.blit(msg, (bx, by))
+        state["msg_timer"] -= 1
+
+
+# ============================================================
+# DESKTOP PANEL RENDER
+# ============================================================
+def render_desktop_panel(tgt):
+    DESKTOP_BG = (15, 15, 20)
+    DESKTOP_PANEL = (25, 25, 35)
+    DESKTOP_ACCENT = (0, 255, 200)
+    DESKTOP_TEXT = (200, 200, 200)
+    DESKTOP_DIM = (120, 120, 130)
+    DESKTOP_RED = (255, 80, 80)
+
+    window.fill(DESKTOP_BG)
+    
+    # Side Panel Background
+    panel_x = 600
+    pygame.draw.rect(window, DESKTOP_PANEL, (panel_x, 0, DESKTOP_W - panel_x, DESKTOP_H))
+    
+    # OLED Bezel Configuration
+    bezel_x, bezel_y = 40, 40
+    
+    # Shadow
+    pygame.draw.rect(window, (0,0,0), (bezel_x+5, bezel_y+5, SKY_W, SKY_H), border_radius=10)
+    # Bezel frame
+    pygame.draw.rect(window, (40, 40, 50), (bezel_x-10, bezel_y-10, SKY_W+20, SKY_H+20), border_radius=10)
+    # Inner screen background
+    pygame.draw.rect(window, (0,0,0), (bezel_x, bezel_y, SKY_W, SKY_H), border_radius=4)
+    
+    # Render native sky view onto window
+    render_desktop_sky(tgt)
+    window.blit(sky_surf, (bezel_x, bezel_y))
+    
+    # --- Right Side Panel Content (Information) ---
+    y = 40
+    window.blit(DESKTOP_FONT_TITLE.render("STAR TRACKER", False, DESKTOP_ACCENT), (panel_x + 20, y))
+    y += 35
+    window.blit(DESKTOP_FONT_MED.render("OBSERVATORY CONTROL", False, DESKTOP_TEXT), (panel_x + 20, y))
+    y += 40
+    pygame.draw.line(window, DESKTOP_DIM, (panel_x + 20, y), (DESKTOP_W - 20, y))
+    y += 20
+    
+    # Telemetry
+    window.blit(DESKTOP_FONT_MED.render("TELEMETRY", False, DESKTOP_ACCENT), (panel_x + 20, y))
+    y += 25
+    info_lines = [
+        f"YAW:   {int(state['current_yaw']) % 360:03d} deg",
+        f"PITCH: {int(state['current_pitch']):+03d} deg",
+        f"ROLL:  {int(state['current_roll']):+02d} deg",
+        f"LOC:   {LAT}, {LON}"
+    ]
+    for line in info_lines:
+        window.blit(DESKTOP_FONT_SM.render(line, False, DESKTOP_TEXT), (panel_x + 30, y))
+        y += 20
+    y += 20
+    
+    # Target Info
+    if tgt:
+        window.blit(DESKTOP_FONT_MED.render(f"TARGET: {tgt.short}", False, DESKTOP_ACCENT), (panel_x + 20, y))
+        y += 25
+        tgt_lines = [
+            f"Name:  {tgt.name}",
+            f"Type:  {tgt.kind.upper()} ({tgt.sub})",
+            f"Cons:  {tgt.constellation}",
+            f"Mag:   {tgt.mag:+.2f}",
+            f"Dist:  {tgt.distance}"
+        ]
+        for line in tgt_lines:
+            window.blit(DESKTOP_FONT_SM.render(line, False, DESKTOP_TEXT), (panel_x + 30, y))
+            y += 20
+        
+        if tgt.name == "Moon":
+            y += 10
+            window.blit(DESKTOP_FONT_MED.render(f"MOON PHASE: {tgt.phase:.1f}%", False, DESKTOP_RED), (panel_x + 20, y))
+            y += 25
+            phase_desc = "Waxing" if tgt.is_waxing else "Waning"
+            window.blit(DESKTOP_FONT_SM.render(f"Status: {phase_desc}", False, DESKTOP_TEXT), (panel_x + 30, y))
+            y += 20
+
+        y += 10
+        pygame.draw.line(window, DESKTOP_DIM, (panel_x + 20, y), (DESKTOP_W - 20, y))
+        y += 10
+        desc_lines = wrap_text(tgt.description, DESKTOP_FONT_SM, DESKTOP_W - panel_x - 40)
+        for line in desc_lines:
+            window.blit(DESKTOP_FONT_SM.render(line, False, DESKTOP_TEXT), (panel_x + 20, y))
+            y += 20
+
+    # --- Bottom Left Controls ---
+    # Positioned under the OLED Bezel
+    ctrl_x = 40
+    ctrl_y = DESKTOP_H - 140
+    
+    window.blit(DESKTOP_FONT_MED.render("CONTROLS", False, DESKTOP_ACCENT), (ctrl_x, ctrl_y))
+    ctrl_y += 25
+    ctrl_lines = [
+        "[ESC] Exit Program",
+        "[SPACE] Next Target",
+        "[I] Toggle Info Sheet",
+        "[C] Calibrate IMU",
+        "[WASD] Pan View (Sim)",
+        "[QE] Roll View (Sim)"
+    ]
+    for line in ctrl_lines:
+        window.blit(DESKTOP_FONT_SM.render(line, False, DESKTOP_TEXT), (ctrl_x + 10, ctrl_y))
+        ctrl_y += 20
+
+
+# ============================================================
+# MAIN LOOP
+# ============================================================
+clock = pygame.time.Clock()
+
+print("=== Star Tracker HUD ===")
+print("Controls (click on the window to activate them):")
+print(" ESC    : Exit program")
+print(" SPACE  : Next target")
+print(" I      : Toggle Info Page")
+print(" C      : Calibrate")
+print(" L      : Toggle labels")
+print(" N      : Toggle DSO (Nebulae/Galaxies)")
+print(" O      : Toggle constellations")
+print(" UP/DN  : Magnitude filter")
+if not bno:
+    print(" WASD   : Move view (PC simulation)")
+    print(" Q/E    : Rotate view (PC simulation)")
+
+try:
+    while True:
+        now = time.time()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    pygame.quit(); sys.exit()
+                elif ev.key == pygame.K_SPACE:
+                    next_target()
+                elif ev.key == pygame.K_i:
+                    state["show_info"] = not state["show_info"]
+                    show_message(f"INFO: {'ON' if state['show_info'] else 'OFF'}")
+                elif ev.key == pygame.K_c:
+                    do_calibrate()
+                elif ev.key == pygame.K_l:
+                    state["show_label"] = not state["show_label"]
+                    show_message(f"LABELS: {'ON' if state['show_label'] else 'OFF'}")
+                elif ev.key == pygame.K_n:
+                    state["show_dso"] = not state["show_dso"]
+                    show_message(f"DSO: {'ON' if state['show_dso'] else 'OFF'}")
+                elif ev.key == pygame.K_o:
+                    state["show_const"] = not state["show_const"]
+                    show_message(f"CONST: {'ON' if state['show_const'] else 'OFF'}")
+                elif ev.key == pygame.K_UP:
+                    state["filter_mag"] = min(8.0, state["filter_mag"] + 0.5)
+                    show_message(f"MAG <= {state['filter_mag']:.1f}")
+                elif ev.key == pygame.K_DOWN:
+                    state["filter_mag"] = max(1.0, state["filter_mag"] - 0.5)
+                    show_message(f"MAG <= {state['filter_mag']:.1f}")
+
+        # ---- IMU / Desktop simulation controls ----
+        if bno:
+            try:
+                e = bno.euler
+                if e[0] is not None:
+                    state["raw_yaw"]       = e[0]
+                    state["current_yaw"]   = (state["raw_yaw"] + state["yaw_offset"]) % 360
+                    state["current_pitch"] = (e[2] or 0.0) + state["pitch_offset"]
+                    state["current_roll"]  = (e[1] or 0.0)
+            except Exception:
+                pass
+        else:
+            keys = pygame.key.get_pressed()
+            if keys[pygame.K_a]: state["current_yaw"] = (state["current_yaw"] - 1.5) % 360
+            if keys[pygame.K_d]: state["current_yaw"] = (state["current_yaw"] + 1.5) % 360
+            if keys[pygame.K_w]: state["current_pitch"] = min(90, state["current_pitch"] + 1.0)
+            if keys[pygame.K_s]: state["current_pitch"] = max(-90, state["current_pitch"] - 1.0)
+            if keys[pygame.K_q]: state["current_roll"] = max(-90, state["current_roll"] - 1.0)
+            if keys[pygame.K_e]: state["current_roll"] = min(90, state["current_roll"] + 1.0)
+
+        # ---- Astronomy refresh ----
+        if now - state["last_astro"] > ASTRO_REFRESH:
+            update_positions()
+            state["last_astro"] = now
+
+        # ---- Render OLED ----
+        render_oled()
+        
+        # Push to physical OLED
+        if HAS_OLED:
+            raw = pygame.image.tostring(screen, "RGB")
+            pil_img = Image.frombytes("RGB", (SCREEN_W, SCREEN_H), raw).convert("L")
+            pil_img = pil_img.point(lambda p: 255 if p > 80 else 0).convert("1")
+            oled.display(pil_img)
+            
+        # ---- Render Desktop Panel ----
+        tgt = CATALOG[state["target_index"]] if CATALOG else None
+        render_desktop_panel(tgt)
+        pygame.display.flip()
+        
+        clock.tick(FPS)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    if HAS_OLED: oled.clear()
+    pygame.quit()
+    sys.exit(0)
